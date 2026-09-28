@@ -5,7 +5,7 @@ CXXFLAGS ?= -O3 -std=c++20
 CPPFLAGS += -Isrc/brob -Isrc/full
 LDLIBS   += -lpthread
 
-BROB = src/brob/xcube.o src/brob/cornersolver.o src/brob/wingsolver.o src/brob/util.o
+BROB = src/brob/xcube.o src/brob/cornersolver.o src/brob/wingsolver.o src/brob/util.o src/brob/facelets.o
 OBJS = src/full/gullicube.o src/full/brobglue.o $(BROB)
 HDRS = $(wildcard src/full/*.h src/pair/*.h src/brob/*.h)
 

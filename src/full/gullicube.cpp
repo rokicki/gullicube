@@ -8,14 +8,15 @@
 //      concatenated with --fast)
 //   3. diagonal orbits (a,a) and mid-centre orbits (Mx,b): single-orbit beams
 //
-//   gullicube [-i | -r n | -R] [-o] [-b WIDTH] [-2] [--fast] [-E] [-t THREADS]
+//   gullicube [-i | -f | -r n | -R] [-F] [-o] [-b WIDTH] [-2] [--fast] [-E] [-t THREADS]
 //             [--seed S] [--setupcost Q] [--verify] N
 //
 // Options follow brobdicube's where they overlap.  -i reads scramble moves from
-// stdin, -r n / -R scramble with n / 50*N random moves; without any of these
-// the state is uniformly random (brobdicube 'R' mode).  --verify replays the
-// scramble and solution on an independent sticker simulator (needs a move
-// scramble).
+// stdin, -f a Kociemba facelet string (facelets.h), -r n / -R scramble with
+// n / 50*N random moves; without any of these the state is uniformly random
+// (brobdicube 'R' mode).  -F prints the start state as a facelet string.
+// --verify replays the scramble (or loads the facelets) and the solution on
+// an independent sticker simulator.
 //
 // -2: solve the whole cube at beam width 1, 2, 4, 8, ... (growth --grow, --reps
 // runs per width, each with its own seed) from the same scrambled cube,
@@ -36,6 +37,7 @@
 #include "classpool.h"
 #include "wings.h"
 #include "replay.h"
+#include "facelets.h"
 #include "cornersolver.h"
 #include "../pair/cube.h"
 #include <atomic>
@@ -92,6 +94,7 @@ static std::vector<mv> mapped(const Pool &p, uint32_t a, int d2, int d3) {
 struct Opts {
   int N = 0, width = 16, threads = (int)std::thread::hardware_concurrency();
   long scrLen = 0;
+  bool readFacelets = false, printFacelets = false;
   bool readScramble = false, writeMoves = false, useEG = false, verify = false, fast = false, doubling = false;
   bool fallbackOnly = false, useTopK = false, useIndex = false, keepSolved = true, strictKeep = false;
   uint64_t seed = 0;  // 0: pick one from entropy (printed, so the run can be repeated)
@@ -862,6 +865,12 @@ static void usage() {
       "    -r n            scramble with n random moves\n"
       "    -R              scramble with 50*N random moves\n"
       "    -i              read the scramble moves from stdin\n"
+      "    -f              read the cube state from stdin as a Kociemba facelet string: 6*N*N\n"
+      "                    letters, faces U R F D L B, each row by row as seen in the usual net\n"
+      "                    (U with B at the top, D with F at the top, the others with U at the\n"
+      "                    top); each letter names the face whose colour the sticker has when\n"
+      "                    solved; whitespace is ignored\n"
+      "    -F              print the start state as a Kociemba facelet string\n"
       "    --seed s        random seed (default: from entropy; the seed used is printed)\n"
       "  search:\n"
       "    -b w            beam width, all phases (with -2: the maximum width)\n"
@@ -934,6 +943,8 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "-i") o.readScramble = true;                 // read scramble moves from stdin
+    else if (a == "-f") o.readFacelets = true;            // read a Kociemba facelet string from stdin
+    else if (a == "-F") o.printFacelets = true;           // print the start state as a facelet string
     else if (a == "-r") o.scrLen = atol(argv[++i]);       // scramble with n random moves
     else if (a == "-R") autoLen = true;                   // scramble with 50*N random moves
     else if (a == "-o") o.writeMoves = true;              // write solution (lines start with a space)
@@ -1003,7 +1014,11 @@ int main(int argc, char **argv) {
 
   // the scrambled cube; every solve works on a copy
   std::vector<mv> scramble;
-  if (o.readScramble) {
+  std::string facelets;  // with -f
+  if (o.readFacelets) {
+    std::string line;
+    while (std::getline(std::cin, line)) facelets += line;
+  } else if (o.readScramble) {
     std::string line, all;
     while (std::getline(std::cin, line)) all += line + " ";
     scramble = parse_moves(all);
@@ -1012,8 +1027,13 @@ int main(int argc, char **argv) {
       scramble.push_back({1 + (int)(rng() % ((N + 1) / 2)), (short)(rng() % 6), (short)(1 + rng() % 3)});
   const bool fromMoves = o.readScramble || o.scrLen;
   moveset = scramble;  // brobdicube's 'I' construction applies this global
-  xcube initial(Mx, My, fromMoves ? 'I' : 'R');
+  xcube initial(Mx, My, o.readFacelets ? 'C' : fromMoves ? 'I' : 'R');
   moveset.clear();
+  if (o.readFacelets) {
+    std::string err;
+    if (!xcube_from_facelets(initial, facelets, err)) { fprintf(stderr, "bad facelets: %s\n", err.c_str()); return 1; }
+  }
+  if (o.printFacelets) printf("facelets %s\n", xcube_to_facelets(initial).c_str());
 
   const bool keep = o.writeMoves || o.verify;
   Result best;
@@ -1122,11 +1142,19 @@ int main(int argc, char **argv) {
     }
   }
   if (o.verify) {
-    if (!fromMoves) { printf("  (--verify needs a move scramble: -i, -r or -R)\n"); return !best.solved; }
-    // independent check: replay scramble + solution on the pair-project sticker simulator
+    if (!fromMoves && !o.readFacelets) { printf("  (--verify needs a move scramble or facelets: -i, -f, -r or -R)\n"); return !best.solved; }
+    // independent check: replay scramble (or load the facelets) + solution on the
+    // pair-project sticker simulator
     Cube sim(N);
     std::vector<uint8_t> col(sim.pos.size());
     for (size_t i = 0; i < col.size(); i++) col[i] = sim.face[i];
+    if (o.readFacelets) {  // the simulator's own facelet geometry (Cube::kociemba)
+      std::string s;
+      for (char c : facelets) if (c > ' ') s += c;
+      for (int kf = 0, k = 0; kf < 6; kf++)
+        for (int r = 0; r < N; r++)
+          for (int c = 0; c < N; c++, k++) col[sim.kociemba(kf, r, c)] = face_of_char(s[k]);
+    }
     auto play = [&](const std::vector<mv> &ms) {
       for (auto m : ms) {
         const auto &P = sim.movePerm[m.face][m.dep - 1];

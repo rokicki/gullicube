@@ -94,6 +94,9 @@ struct Cube {
   std::vector<std::vector<std::vector<int>>> movePerm;
   std::vector<int> orbit;  // orbit id per sticker
   int norbits = 0;
+  std::vector<int> lut;  // sticker index by position (see key)
+  int W = 0;
+  int key(const std::array<int, 3> &p) const { return ((p[0] + n) * W + (p[1] + n)) * W + (p[2] + n); }
 
   int find(const std::array<int, 3> &p) const {
     for (size_t i = 0; i < pos.size(); i++)
@@ -124,9 +127,8 @@ struct Cube {
     }
     int S = pos.size();
     // lookup table
-    int W = 2 * n + 1;
-    std::vector<int> lut(W * W * W, -1);
-    auto key = [&](const std::array<int, 3> &p) { return ((p[0] + n) * W + (p[1] + n)) * W + (p[2] + n); };
+    W = 2 * n + 1;
+    lut.assign((size_t)W * W * W, -1);
     for (int i = 0; i < S; i++) lut[key(pos[i])] = i;
     movePerm.assign(6, std::vector<std::vector<int>>(n));
     for (int f = 0; f < 6; f++) {
@@ -178,6 +180,23 @@ struct Cube {
       if (id[r] < 0) id[r] = norbits++;
       orbit[i] = id[r];
     }
+  }
+  // Sticker index of a Kociemba facelet: face kf in the order U R F D L B,
+  // row r and column c as the face is seen in the usual net (U with B at the
+  // top, D with F at the top, the other four with U at the top).  Axes: x to
+  // the right (R), y up (U), z towards the viewer (F).
+  int kociemba(int kf, int r, int c) const {
+    const int m = n - 1, a = -m + 2 * c, t = m - 2 * r;
+    std::array<int, 3> p;
+    switch (kf) {
+      case 0: p = {a, n, -m + 2 * r}; break;   // U: back row first
+      case 1: p = {n, t, m - 2 * c}; break;    // R: front column first
+      case 2: p = {a, t, n}; break;            // F
+      case 3: p = {a, -n, m - 2 * r}; break;   // D: front row first
+      case 4: p = {-n, t, -m + 2 * c}; break;  // L: back column first
+      default: p = {m - 2 * c, t, -n}; break;  // B: right column first
+    }
+    return lut[key(p)];
   }
   // depth of sticker from the nearest edge in row / col direction (1-based)
   int drow(int i) const { return std::min(row[i], n - 1 - row[i]) + 1; }
