@@ -852,6 +852,19 @@ static void printDetail(const Opts &o, const Result &r) {
   if (r.sRetries || r.sFallback) printf("  diag/mid retries %ld; 3-cycle fallback used %ld\n", r.sRetries, r.sFallback);
 }
 
+// Conventional move names: no layer deeper than the middle.  Layer d of face f
+// is layer N+1-d of the opposite face turned the other way, so a move deeper
+// than N/2 (the middle slice of an odd cube is kept) is renamed that way.  The
+// permutation is the same; the move count does not change.
+static void conventionalMoves(std::vector<mv> &ms, int N) {
+  for (auto &m : ms)
+    if (2 * m.dep > N + 1) {
+      m.dep = N + 1 - m.dep;
+      m.face = oppface[m.face];
+      m.twist = 4 - m.twist;
+    }
+}
+
 static std::atomic<bool> gStop{false};  // set by Ctrl-C during -2
 static void onSigint(int) {
   gStop = true;
@@ -1129,6 +1142,7 @@ int main(int argc, char **argv) {
     }
   }
 
+  conventionalMoves(best.moves, N);  // what -o prints and --verify replays
   if (o.writeMoves) {
     std::string line;
     for (size_t i = 0; i < best.moves.size(); i++) {
