@@ -715,7 +715,8 @@ struct TableBeam {
     std::vector<Node> nodes;
     nodes.push_back({start, zob(start), 0, -1, 0, 0xFFFF});
     std::vector<int> level = {0};
-    const int SEEN = 1 << 12;
+    int SEEN = 1 << 12;  // duplicate filter, sized to the beam
+    while (SEEN < 64 * TS && SEEN < (1 << 20)) SEEN <<= 1;
     std::vector<uint64_t> seen(SEEN, 0);
     seen[nodes[0].h & (SEEN - 1)] = nodes[0].h;
     if (seeds && !seeds->empty()) {

@@ -25,6 +25,8 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <thread>
+#include <chrono>
 #include "mintree.h"
 
 struct WingPool {
@@ -122,6 +124,7 @@ struct WingTableBeam {
   int mul = 8;  // quarter-moves per wing in place (2 moves; 4..10 measured, 8 best)
   uint64_t seed = 1;
   const std::atomic<bool> *stop = nullptr;
+  int threads = 1;  // threads per beam level (set by the caller: spare threads beyond one per orbit)
   // finish table
   std::vector<uint64_t> fkey;
   std::vector<uint32_t> falg;
@@ -200,23 +203,40 @@ struct WingTableBeam {
     std::vector<Node> nodes;
     nodes.push_back({start, zob(start), 0, -1, 0, 0xFFFF});
     std::vector<int> level = {0};
-    const int SEEN = 1 << 14;
+    // duplicate filter sized to the beam: a fixed 16k overflowed at width 2048
+    // and cancelling algorithm pairs then cycled until the depth cap
+    int SEEN = 1 << 14;
+    while (SEEN < 64 * TS && SEEN < (1 << 22)) SEEN <<= 1;
     std::vector<uint64_t> seen(SEEN, 0);
     seen[nodes[0].h & (SEEN - 1)] = nodes[0].h;
-    std::vector<Slot> table(TS);
-    MinTree minTree;
     int best4 = 1 << 30, bestNode = -1;
     long bestFin = -1;  // finishing algorithm after bestNode (or -1)
     long bestFinAlg = -1;  // algorithm between bestNode and the finish (-1: none)
     const size_t n = P.size();
     constexpr uint32_t M24 = (1u << 24) - 1;
-    std::vector<uint64_t> ones, twos;
-    for (int depth = 0; depth < 200 && !level.empty(); depth++) {
-      if (stop && stop->load(std::memory_order_relaxed)) return {};
-      for (auto &s : table) s.score = INT32_MIN;
-      minTree.reset(TS);
-      int filled = 0, weakest = INT32_MIN;
-      for (int ni : level) {
+    // Per-thread state for one level: its own candidate table (merged slot by
+    // slot afterwards: each slot keeps its best candidate by score, then the
+    // seeded tie-break, so the table hardly depends on the split) and its own
+    // best solution.
+    struct Ctx {
+      std::vector<Slot> table;
+      MinTree minTree;
+      int filled = 0, weakest = INT32_MIN, best4 = 1 << 30, bestNode = -1;
+      long bestFin = -1, bestFinAlg = -1;
+      std::vector<uint64_t> ones, twos;
+    };
+    const int T = std::max(1, std::min(threads, 64));
+    std::vector<Ctx> ctx(T);
+    for (auto &c : ctx) c.table.resize(TS);
+    auto runNodes = [&](Ctx &cx, size_t from, size_t to) {
+      for (auto &sl : cx.table) sl.score = INT32_MIN;
+      cx.minTree.reset(TS);
+      cx.filled = 0;
+      cx.weakest = INT32_MIN;
+      cx.best4 = best4;
+      cx.bestNode = -1;
+      for (size_t li = from; li < to; li++) {
+        const int ni = level[li];
         const Node &nd = nodes[ni];
         uint32_t V[5] = {0, 0, 0, 0, 0};
         int c0 = 0;
@@ -225,38 +245,39 @@ struct WingTableBeam {
           c0 += nd.v[p] == p;
         }
         if (c0 == 24) {
-          if (nd.g4 < best4) { best4 = nd.g4; bestNode = ni; bestFin = bestFinAlg = -1; }
+          if (nd.g4 < cx.best4) { cx.best4 = nd.g4; cx.bestNode = ni; cx.bestFin = cx.bestFinAlg = -1; }
           continue;
         }
         if (useFinish) {
           long f = findFinish(nd.h);
           uint16_t mg;
           int fc4 = f >= 0 ? 4 * (finPool->cost[f] + seam(nd.tail, finPool->firstG[f], mg)) : 0;
-          if (f >= 0 && nd.g4 + fc4 < best4) { best4 = nd.g4 + fc4; bestNode = ni; bestFin = f; bestFinAlg = -1; }
+          if (f >= 0 && nd.g4 + fc4 < cx.best4) { cx.best4 = nd.g4 + fc4; cx.bestNode = ni; cx.bestFin = f; cx.bestFinAlg = -1; }
         }
         // rejected: algorithms moving >= keepSolved wings already in place
         // (bitset "at least 1" / "at least 2" over the correct slots' bitsets)
         const uint64_t *rejp = nullptr;
         if (keepSolved == 1 || keepSolved == 2) {
-          ones.assign(nw, 0);
-          twos.assign(nw, 0);
-          if (n % 64) twos[nw - 1] = ones[nw - 1] = ~0ULL << (n % 64);  // padding never survives
+          cx.ones.assign(nw, 0);
+          cx.twos.assign(nw, 0);
+          if (n % 64) cx.twos[nw - 1] = cx.ones[nw - 1] = ~0ULL << (n % 64);  // padding never survives
           for (int p = 0; p < 24; p++)
             if (nd.v[p] == p) {
               const uint64_t *b = &BS[p * nw];
-              for (size_t w = 0; w < nw; w++) { twos[w] |= ones[w] & b[w]; ones[w] |= b[w]; }
+              for (size_t w = 0; w < nw; w++) { cx.twos[w] |= cx.ones[w] & b[w]; cx.ones[w] |= b[w]; }
             }
-          rejp = keepSolved == 1 ? ones.data() : twos.data();
+          rejp = keepSolved == 1 ? cx.ones.data() : cx.twos.data();
         }
         auto score = [&](size_t a) {
-          const auto &T = P.T[a];
-          int c = __builtin_popcount(~((V[0] ^ T[0]) | (V[1] ^ T[1]) | (V[2] ^ T[2]) | (V[3] ^ T[3]) | (V[4] ^ T[4])) & M24);
+          const auto &Tp = P.T[a];
+          int c = __builtin_popcount(~((V[0] ^ Tp[0]) | (V[1] ^ Tp[1]) | (V[2] ^ Tp[2]) | (V[3] ^ Tp[3]) | (V[4] ^ Tp[4])) & M24);
           uint16_t merged;
           const int sv = seam(nd.tail, P.firstG[a], merged);
+          if (P.cost[a] + sv <= 0) return;  // adds no moves: only undoes (and lets the beam cycle)
           const int g4 = nd.g4 + 4 * (P.cost[a] + sv);
           const uint16_t ntail = P.ngroups[a] == 1 ? merged == 0xFFFF && sv == 0 ? P.lastG[a] : merged : P.lastG[a];
           int sc = mul * c - g4;
-          if (sc < weakest || g4 >= best4) return;
+          if (sc < cx.weakest || g4 >= cx.best4) return;
           uint64_t h = nd.h;
           const auto &src = P.src[a];
           for (uint32_t m = P.suppMask[a]; m; m &= m - 1) {
@@ -268,15 +289,15 @@ struct WingTableBeam {
             long f = findFinish(h);
             uint16_t mg;
             int fc4 = f >= 0 ? 4 * (finPool->cost[f] + seam(ntail, finPool->firstG[f], mg)) : 0;
-            if (f >= 0 && g4 + fc4 < best4) { best4 = g4 + fc4; bestNode = ni; bestFin = f; bestFinAlg = a; }
+            if (f >= 0 && g4 + fc4 < cx.best4) { cx.best4 = g4 + fc4; cx.bestNode = ni; cx.bestFin = f; cx.bestFinAlg = a; }
           }
           const size_t si = slotOf(h);
-          Slot &sl = table[si];
-          if (sl.score == INT32_MIN) filled++;
+          Slot &sl = cx.table[si];
+          if (sl.score == INT32_MIN) cx.filled++;
           else if (sc < sl.score || (sc == sl.score && tieKey(h) >= tieKey(sl.h))) return;
           sl = {sc, ni, (uint32_t)a, g4, h, ntail};
-          minTree.set(si, sc);
-          if (filled == TS) weakest = minTree.min();
+          cx.minTree.set(si, sc);
+          if (cx.filled == TS) cx.weakest = cx.minTree.min();
         };
         if (rejp) {
           for (size_t w = 0; w < nw; w++)
@@ -284,8 +305,36 @@ struct WingTableBeam {
         } else
           for (size_t a = 0; a < n; a++) score(a);
       }
+    };
+    const auto tBeam0 = std::chrono::steady_clock::now();
+    for (int depth = 0; depth < 200 && !level.empty(); depth++) {
+      if (getenv("WINGSTAT"))
+        fprintf(stderr, "    depth %d: level %zu, %.2fs, best %d\n", depth, level.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tBeam0).count(), best4);
+      if (stop && stop->load(std::memory_order_relaxed)) return {};
+      // split the level over the threads (one thread for small levels)
+      const int U = level.size() >= (size_t)(8 * T) ? T : 1;
+      if (U == 1) runNodes(ctx[0], 0, level.size());
+      else {
+        std::vector<std::thread> th;
+        for (int u = 1; u < U; u++) th.emplace_back(runNodes, std::ref(ctx[u]), level.size() * u / U, level.size() * (u + 1) / U);
+        runNodes(ctx[0], 0, level.size() / U);
+        for (auto &t : th) t.join();
+      }
+      for (int u = 0; u < U; u++)
+        if (ctx[u].bestNode >= 0 && ctx[u].best4 < best4) {
+          best4 = ctx[u].best4; bestNode = ctx[u].bestNode; bestFin = ctx[u].bestFin; bestFinAlg = ctx[u].bestFinAlg;
+        }
+      std::vector<Slot> &table = ctx[0].table;
+      for (int u = 1; u < U; u++)
+        for (int i = 0; i < TS; i++) {
+          const Slot &o = ctx[u].table[i];
+          Slot &sl = table[i];
+          if (o.score == INT32_MIN) continue;
+          if (sl.score == INT32_MIN || o.score > sl.score || (o.score == sl.score && tieKey(o.h) < tieKey(sl.h))) sl = o;
+        }
       level.clear();
-      for (auto &sl : table) {
+      for (auto &sl : ctx[0].table) {
         if (sl.score == INT32_MIN) continue;
         Node c;
         const Node &pn = nodes[sl.parent];
@@ -295,6 +344,11 @@ struct WingTableBeam {
         nodes.push_back(c);
         level.push_back(nodes.size() - 1);
       }
+    }
+    if (getenv("WINGSTAT")) {
+      long scored = 0;
+      fprintf(stderr, "  wing beam width %d: %zu nodes, best %d quarter-moves\n", TS, nodes.size(), best4);
+      (void)scored;
     }
     if (bestNode < 0) return {};
     std::vector<uint32_t> r;

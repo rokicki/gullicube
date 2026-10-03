@@ -314,6 +314,9 @@ struct Res {
         if (o.wingFinFile && !minedWingsFin.load(o.wingFinFile)) { fprintf(stderr, "cannot read %s\n", o.wingFinFile); return false; }
         wingTable.build(minedWings, o.wingFinFile ? &minedWingsFin : nullptr);
       }
+      // the wing orbits run in parallel; spare threads split each beam level
+      const int orbits = std::max(1, (o.N - 2) / 2);
+      wingTable.threads = std::max(1, o.threads / std::min(orbits, std::max(1, o.threads)));
     }
     return true;
     mark("wing table beam"); (void)tl0;
@@ -322,6 +325,7 @@ struct Res {
   void setSeed(uint64_t seed) { pairBeam.slotSeed = diagBeam.slotSeed = midBeam.slotSeed = seed | 1; }
   void setStop(const std::atomic<bool> *s) {
     pairBeam.stop = diagBeam.stop = midBeam.stop = pairSolver.stop = fbSolver.stop = diagSolver.stop = midSolver.stop = s;
+    wingTable.stop = s;
   }
   const Pool &pairPoolOf(uint8_t id) const {
     return id == 0 ? pairPool : id == 1 ? eg.cand : id == 2 ? eg.fin : id == 3 ? (fbSame ? pairPool : fbPool)
@@ -1165,11 +1169,15 @@ int main(int argc, char **argv) {
     std::vector<std::pair<int, double>> probes;
     const double tProbe0 = now();
     long runNo = 0;
+    std::signal(SIGINT, onSigint);  // Ctrl-C: stop and report the best solve so far
     auto runAt = [&](int w, const char *what) {
+      if (gStop) return false;
       uint64_t sd = runSeed(runNo++);
       R->setSeed(sd);
-      Result r = solveOnce(*R, o, initial, w, nullptr, keep, sd);
-      if (!r.ok) return false;
+      const std::atomic<bool> *stop = best.ok ? &gStop : nullptr;  // the first run always completes
+      R->setStop(stop);
+      Result r = solveOnce(*R, o, initial, w, stop, keep, sd);
+      if (r.aborted || !r.ok) return false;
       const bool better = !best.ok || r.total() < best.total();
       printf("  %s width %5d: total %8ld  %.2fs%s\n", what, w, r.total(), r.tTotal, better ? "  best" : "");
       fflush(stdout);
@@ -1184,9 +1192,9 @@ int main(int argc, char **argv) {
     };
     int w = 1;
     if (!runAt(w, "probe")) return 1;
-    while (w < maxW && (now() - tProbe0) + predict(2 * w) <= 0.1 * solveBudget) {
+    while (!gStop && w < maxW && (now() - tProbe0) + predict(2 * w) <= 0.1 * solveBudget) {
       w *= 2;
-      if (!runAt(w, "probe")) return 1;
+      if (!runAt(w, "probe") && !gStop) return 1;
     }
     // final run: the widest width predicted to fit 85% of what is left
     const double left = target - (now() - tProgram);
@@ -1196,10 +1204,11 @@ int main(int argc, char **argv) {
       if (predict(mid) <= 0.85 * left) lo = mid;
       else hi = mid - 1;
     }
-    if (lo > w) {
+    if (lo > w && !gStop) {
       printf("  final width %d (predicted %.1fs of %.1fs left)\n", lo, predict(lo), left);
-      if (!runAt(lo, "final")) return 1;
+      if (!runAt(lo, "final") && !gStop) return 1;
     }
+    if (gStop) printf("  (interrupted: the best solve so far)\n");
     printDetail(o, best);
     printf("  TOTAL          %6ld moves   (load %.1fs, corners %.2fs, wall %.3fs; time-budget run %.1fs of %.1fs)\n",
            best.total(), tLoad, best.tCorners, best.tTotal, now() - tProgram, target);
