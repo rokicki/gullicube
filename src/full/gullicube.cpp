@@ -61,8 +61,10 @@ static double now() {
 static bool gPairMerge = false;  // --pairmerge: plain pairwise merge
 static bool gOldMerge = false;   // --oldmerge: merge beam / greedy merge (the previous default)
 static int gMergeRestarts = 256; // --mergerestarts
+static int gMergeThreads = 1;    // the merge's restarts run on the solve's threads (-t)
+// restarts: at most this many restarts of the default merge (-1: --mergerestarts)
 static std::vector<mv> mergeWith(Merger &mg, int beamOpt, long &raw, long &merged, std::vector<int> *order = nullptr,
-                                 double budget = 0, const char *what = "") {
+                                 double budget = 0, const char *what = "", int restarts = -1) {
   size_t n = mg.insts.size();
   if (const char *dump = getenv("MERGEDUMP")) {  // experiment: write the merge input (devtools/mergebound)
     static std::atomic<int> seq{0};
@@ -89,7 +91,8 @@ static std::vector<mv> mergeWith(Merger &mg, int beamOpt, long &raw, long &merge
   }
   if (!gOldMerge && beamOpt < 0) {  // pairwise (or levels) + improvement + restarts within the budget
     mg.budget = budget;
-    mg.restarts = gMergeRestarts;
+    mg.restarts = restarts >= 0 ? std::min(restarts, gMergeRestarts) : gMergeRestarts;
+    mg.threads = gMergeThreads;
     double t0 = now();
     auto r = mg.mergeBest(raw, merged, order);
     if (getenv("MERGETIME"))
@@ -641,7 +644,8 @@ static Result finishCentres(const Res &R, const Opts &o, const EdgesOut &E, cons
         fprintf(stderr, "MERGESTAT pairs: %zu algorithm instances, %ld raw moves, %ld face turns\n", mg.insts.size(), all, faces);
       }
       mg.stop = stop;
-      seq = mergeWith(mg, o.mergeBeam, res.pairsRaw, res.pairs, &pairOrder, mergeBudget, "pairs");
+      // with the combined merge to come, this one only orders the pairs (and is a fallback): no restarts
+      seq = mergeWith(mg, o.mergeBeam, res.pairsRaw, res.pairs, &pairOrder, mergeBudget, "pairs", one ? 0 : -1);
       if (stopped()) { res.aborted = true; return res; }
       pairInst = solutionOrder();  // instance index -> (pair, algorithm)
       pairsMerged1 = res.pairs;
@@ -762,7 +766,8 @@ static Result finishCentres(const Res &R, const Opts &o, const EdgesOut &E, cons
         res.diagmidRaw = res.diagmid = seq.size();
       } else {
         mg.stop = stop;
-        seq = mergeWith(mg, o.mergeBeam, res.diagmidRaw, res.diagmid, nullptr, mergeBudget, "diagmid");
+        seq = mergeWith(mg, o.mergeBeam, res.diagmidRaw, res.diagmid, nullptr, one ? mergeBudget : 0.2 * mergeBudget, "diagmid",
+                        one ? 0 : -1);
         if (stopped()) { res.aborted = true; return res; }
       }
       if (one) {
@@ -936,7 +941,7 @@ static void usage() {
       "    --mergebeam w   merge with a beam of width w (0: the greedy merge); with --oldmerge the\n"
       "                    default is 256 up to 400 algorithm instances, 64 up to 1500, else greedy\n"
       "    --mergerestarts k  merge: at most k seeded restarts of the pairwise merge within the\n"
-      "                    merge time budget (default 256)\n"
+      "                    merge time budget, on the -t threads (default 256; -2: at least 4 x width)\n"
       "    --oldmerge      merge with the merge beam / greedy merge (the previous default)\n"
       "    --pairmerge     merge with the plain pairwise merge (no improvement, no restarts)\n"
       "    --seam/--noseam pair/diagonal/mid beams: cost minus moves cancelling with the previous\n"
@@ -1046,6 +1051,7 @@ int main(int argc, char **argv) {
   }
   if (autoLen) o.scrLen = 50L * o.N;
   if (o.fast && !widthGiven) o.width = 1;
+  gMergeThreads = std::max(1, o.threads);
   if (o.fast && !o.finishGiven) o.finish = false;
   // wings: the mined-pool table beam by default, except --fast (thousands of
   // wing orbits at huge N) or --oldwings
@@ -1091,6 +1097,7 @@ int main(int argc, char **argv) {
   if (o.printFacelets) printf("facelets %s\n", xcube_to_facelets(initial).c_str());
 
   const bool keep = o.writeMoves || o.verify;
+  const int baseRestarts = gMergeRestarts;
   Result best;
   if (!o.doubling) {
     R->setSeed(o.seed);
@@ -1119,6 +1126,7 @@ int main(int argc, char **argv) {
           R->setStop(stop);
           uint64_t sd = runSeed(runNo++);
           R->setSeed(sd);
+          gMergeRestarts = std::max(baseRestarts, 4 * w);  // -2: wider steps, bigger budgets, more restarts
           Result r = solveOnce(*R, o, initial, w, stop, keep, sd);
           if (r.aborted || !r.ok) { gStop = true; break; }
           bool better = !best.ok || r.total() < best.total();

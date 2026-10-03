@@ -21,6 +21,8 @@
 #include <unordered_map>
 #include <queue>
 #include <tuple>
+#include <thread>
+#include <mutex>
 
 struct PLayer { int8_t axis; int16_t pos; int8_t amt; };
 
@@ -612,6 +614,8 @@ class Merger {
   // before the run and every successor after it (order labels) and the
   // pairwise seam savings rise.  Passes until nothing gains (at most maxPass).
   int impRun = 3, impPass = 20, impCand = 64;
+  // improvement stops at this time (mergeBest sets it from `budget`)
+  std::chrono::steady_clock::time_point impDeadline = std::chrono::steady_clock::time_point::max();
   std::vector<int> improveOrder(const std::vector<int> &start) const {
     const int n = insts.size();
     if (n < 2) return start;
@@ -663,7 +667,9 @@ class Merger {
     for (int pass = 0; pass < impPass; pass++) {
       if (stop && stop->load(std::memory_order_relaxed)) break;
       long accepted = 0;
-      for (int x0 = 0; x0 < n; x0++) {
+      bool late = false;
+      for (int x0 = 0; x0 < n && !late; x0++) {
+        if ((x0 & 255) == 0 && std::chrono::steady_clock::now() > impDeadline) late = true;
         int xe = x0;
         for (int len = 1; len <= impRun; len++) {
           if (len > 1) { xe = nx[xe]; if (xe < 0) break; }
@@ -724,7 +730,7 @@ class Merger {
           break;
         }
       }
-      if (!accepted) break;
+      if (!accepted || late) break;
     }
     std::vector<int> out;
     for (int x = first; x >= 0; x = nx[x]) out.push_back(x);
@@ -734,6 +740,7 @@ class Merger {
   // seeded pairwise restarts, each improved, while the time `budget` allows
   // and at most `restarts` of them; the cheapest order wins.
   int restarts = 256;
+  int threads = 1;  // restarts run on this many threads (the result does not depend on it)
   int pairMaxInst = 20000;
   long statRestarts = 0;
   std::vector<mv> mergeBest(long &rawMoves, long &mergedMoves, std::vector<int> *order = nullptr) {
@@ -742,6 +749,8 @@ class Merger {
     rawMoves = 0;
     for (auto &in : insts) rawMoves += in.moves.size();
     const int n = insts.size();
+    impDeadline = budget > 0 ? t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(budget))
+                             : std::chrono::steady_clock::time_point::max();
     std::vector<int> best;
     if (n <= pairMaxInst) {
       long r, m;
@@ -752,22 +761,40 @@ class Merger {
     best = improveOrder(best);
     long bestCost = orderCost(best);
     statRestarts = 0;
-    if (n <= pairMaxInst) {
+    if (n <= pairMaxInst && restarts > 0) {
+      // seeded restarts on `threads` threads; each improved; the cheapest order
+      // wins, ties to the lower seed (so the result does not depend on timing)
       const double one = elapsed();  // a restart costs about as much as the first run
-      for (int k = 1; k <= restarts; k++) {
-        if (stop && stop->load(std::memory_order_relaxed)) break;
-        if (budget > 0 && elapsed() + one > budget) break;
+      std::atomic<int> nextSeed{1};
+      std::atomic<long> done{0};
+      std::mutex mu;
+      int bestSeed = 0;
+      auto worker = [&]() {
         Merger m = *this;
-        m.pairSeed = k;
         m.budget = 0;
-        long r, x;
-        std::vector<int> o;
-        m.mergePairwise(r, x, &o);
-        o = improveOrder(o);
-        const long c = orderCost(o);
-        statRestarts++;
-        if (c < bestCost) { bestCost = c; best = std::move(o); }
-      }
+        m.stop = stop;
+        for (;;) {
+          if (stop && stop->load(std::memory_order_relaxed)) break;
+          if (budget > 0 && elapsed() + one > budget) break;
+          const int k = nextSeed++;
+          if (k > restarts) break;
+          m.pairSeed = k;
+          long r, x;
+          std::vector<int> o;
+          m.mergePairwise(r, x, &o);
+          o = m.improveOrder(o);
+          const long c = m.orderCost(o);
+          done++;
+          std::lock_guard<std::mutex> g(mu);
+          if (c < bestCost || (c == bestCost && k < bestSeed)) { bestCost = c; bestSeed = k; best = std::move(o); }
+        }
+      };
+      const int T = std::max(1, std::min(threads, restarts));
+      std::vector<std::thread> th;
+      for (int t = 1; t < T; t++) th.emplace_back(worker);
+      worker();
+      for (auto &t : th) t.join();
+      statRestarts = done;
     }
     pairSeed = 0;
     tail.clear();
