@@ -13,6 +13,9 @@
 // effcost charges face-turn setup moves (the X of X c X') at a discount, since
 // those mostly cancel when many orbit solutions are merged.
 #pragma once
+#include <mutex>
+#include <memory>
+#include <cmath>
 #include "mintree.h"
 #include "../pair/pool.h"
 #include "../pair/eg2.h"
@@ -342,17 +345,20 @@ struct FinishTable {
   static_assert(sizeof(Slot) == 16);
   std::vector<Slot> own;        // the table (built, or read from a saved file)
   const Slot *slots = nullptr;  // own.data()
-  uint64_t mask = 0;
+  uint64_t nslots = 0;          // any size below 2^32: the home slot is a multiply-shift of the key's high half
   size_t used = 0;
+  size_t home(uint64_t k) const { return (size_t)(((k >> 32) * nslots) >> 32); }
+  size_t step(size_t i) const { return i + 1 == nslots ? 0 : i + 1; }
   const FinishTable *next = nullptr;  // a second table probed as well (cheapest hit wins)
   FinishTable() = default;
   FinishTable(const FinishTable &) = delete;
-  void init(size_t capacity) {
-    size_t sz = 1;  // capacity counts duplicates (many algorithms finish the same state)
-    while (sz < capacity + capacity / 4) sz <<= 1;
+  void init(size_t capacity) {  // capacity: the most states it will hold
+    initSlots(capacity + capacity / 4 + 16);
+  }
+  void initSlots(size_t sz) {
     own.assign(sz, Slot{0, 0, 0, 0, 0});
     slots = own.data();
-    mask = sz - 1;
+    nslots = sz;
     used = 0;
   }
   // add every algorithm of p (effective costs eff4) under pool id `id`
@@ -385,7 +391,7 @@ struct FinishTable {
     }
     ~Batch() { flush(); }
     void add(uint64_t k, int e, int c, uint8_t id, uint32_t b) {
-      __builtin_prefetch(&t.own[k & t.mask], 1);
+      __builtin_prefetch(&t.own[t.home(k)], 1);
       if (n == RING) {  // the oldest pending insert's line has had RING inserts' time to arrive
         put(ring[head]);
         head = (head + 1) % RING;
@@ -407,7 +413,7 @@ struct FinishTable {
     Slot nv{k, b, (int16_t)e, id, (uint8_t)c};
     uint64_t nval;
     memcpy(&nval, (const char *)&nv + 8, 8);
-    for (size_t i = k & mask;; i = (i + 1) & mask) {
+    for (size_t i = home(k);; i = step(i)) {
       std::atomic_ref<uint64_t> key(own[i].key);
       uint64_t cur = key.load(std::memory_order_acquire);
       if (cur == 0) {
@@ -420,23 +426,24 @@ struct FinishTable {
       for (;;) {
         Slot os;
         memcpy((char *)&os + 8, &old, 8);
-        if (old != 0 && os.e4 <= e) return claimed;
+        // keep the cheapest, ties to the lower (pool, algorithm): the result does not depend on thread timing
+        if (old != 0 && (os.e4 < e || (os.e4 == e && (os.pid < id || (os.pid == id && os.alg <= b))))) return claimed;
         if (val.compare_exchange_weak(old, nval)) return claimed;
       }
     }
   }
   void insertKey(uint64_t k, int e, int c, uint8_t id, uint32_t b) {
-    for (size_t i = k & mask;; i = (i + 1) & mask) {
+    for (size_t i = home(k);; i = step(i)) {
       Slot &s = own[i];
       if (s.key == k) {
-        if (e < s.e4) s = {k, b, (int16_t)e, id, (uint8_t)c};
+        if (e < s.e4 || (e == s.e4 && (id < s.pid || (id == s.pid && b < s.alg)))) s = {k, b, (int16_t)e, id, (uint8_t)c};
         return;
       }
       if (s.key == 0) { s = {k, b, (int16_t)e, id, (uint8_t)c}; used++; return; }
     }
   }
   const Slot *find1(uint64_t k) const {
-    for (size_t i = k & mask;; i = (i + 1) & mask) {
+    for (size_t i = home(k);; i = step(i)) {
       if (slots[i].key == k) return &slots[i];
       if (slots[i].key == 0) return nullptr;
     }
@@ -468,9 +475,6 @@ inline void buildFinishFromClassList(FinishTable &own, FinishTable &ext, const P
   own.init(pool.size());
   own.add(pool, Z, eff4, 0);
   own.next = &ext;
-  size_t cap = 0;
-  for (auto &e : list) cap += e.first->size() * 96;  // every image, duplicates included
-  ext.init(cap);
   {
     // Keys straight from the class representative: image = sigma o q o sigma^-1
     // (q = the representative's perm or its inverse), so its key
@@ -485,34 +489,65 @@ inline void buildFinishFromClassList(FinishTable &own, FinishTable &ext, const P
       for (int x = 0; x < P; x++)
         for (int j = 0; j < P; j++) KT[(sy * P + x) * P + j] = Z[model.sigma[sy][x]][target(model.sigma[sy][j])];
     const int threads = std::max(1u, std::thread::hardware_concurrency());
+    // every image's key, on all threads: emit(threadState, key, cost, pid, alg)
+    auto forEachKey = [&](auto makeState, auto emit, auto finish) {
+      for (auto &e : list) {
+        const CP &cp = *e.first;
+        const uint8_t pid = e.second;
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < threads; t++)
+          th.emplace_back([&] {
+            auto st = makeState();
+            uint8_t q[2][48];
+            for (size_t lo; (lo = next.fetch_add(4096)) < cp.size();)
+              for (size_t r = lo; r < std::min(cp.size(), lo + 4096); r++) {
+                auto base = model.permOf(cp.rep[r]);
+                for (int j = 0; j < P; j++) { q[0][j] = base[j]; q[1][base[j]] = j; }
+                const int c = cp.cost[r];
+                for (int img = 0; img < 96; img++) {
+                  const uint8_t *qq = q[img & 1];
+                  const uint64_t *kt = &KT[(size_t)(img >> 1) * P * P];
+                  uint64_t k = k0;
+                  for (int j = 0; j < P; j++) k ^= kt[qq[j] * P + j];
+                  emit(*st, k, c, pid, (uint32_t)(r * 96 + img));
+                }
+              }
+            finish(*st);
+          });
+        for (auto &t : th) t.join();
+      }
+    };
+    // Pass 1: the number of distinct states (many images finish the same one),
+    // estimated with a HyperLogLog sketch (2^14 registers, about 1% error), so
+    // the table is sized for the states it will hold.  The keys are Zobrist
+    // XORs, so their bits are already uniform.
+    constexpr int HB = 14;
+    std::vector<uint8_t> reg(1 << HB, 0);
+    std::mutex regMu;
+    forEachKey([] { return std::make_unique<std::vector<uint8_t>>(1 << HB, 0); },
+               [](std::vector<uint8_t> &r, uint64_t k, int, uint8_t, uint32_t) {
+                 const uint64_t rest = k << HB;
+                 const uint8_t rho = rest ? (uint8_t)(__builtin_clzll(rest) + 1) : (uint8_t)(64 - HB + 1);
+                 uint8_t &x = r[k >> (64 - HB)];
+                 if (rho > x) x = rho;
+               },
+               [&](std::vector<uint8_t> &r) {
+                 std::lock_guard<std::mutex> g(regMu);
+                 for (size_t i = 0; i < reg.size(); i++) reg[i] = std::max(reg[i], r[i]);
+               });
+    double sum = 0;
+    size_t zeros = 0;
+    for (auto x : reg) { sum += std::ldexp(1.0, -x); zeros += x == 0; }
+    const double m = reg.size(), alpha = 0.7213 / (1 + 1.079 / m);
+    double est = alpha * m * m / sum;
+    if (est < 2.5 * m && zeros) est = m * std::log(m / zeros);  // small range: linear counting
+    // Pass 2: insert, the table about 74% full (estimate x 1.35, with 3% margin for the estimate)
+    ext.initSlots((size_t)(est * 1.03 * 1.35) + 64);
     std::atomic<size_t> claimedAll{0};
-    for (auto &e : list) {
-    const CP &cp = *e.first;
-    const uint8_t pid = e.second;
-    std::atomic<size_t> next{0};
-    std::vector<std::thread> th;
-    for (int t = 0; t < threads; t++)
-      th.emplace_back([&] {
-        FinishTable::Batch batch(ext, true);
-        uint8_t q[2][48];
-        for (size_t lo; (lo = next.fetch_add(4096)) < cp.size();)
-          for (size_t r = lo; r < std::min(cp.size(), lo + 4096); r++) {
-            auto base = model.permOf(cp.rep[r]);
-            for (int j = 0; j < P; j++) { q[0][j] = base[j]; q[1][base[j]] = j; }
-            const int c = cp.cost[r];
-            for (int img = 0; img < 96; img++) {
-              const uint8_t *qq = q[img & 1];
-              const uint64_t *kt = &KT[(size_t)(img >> 1) * P * P];
-              uint64_t k = k0;
-              for (int j = 0; j < P; j++) k ^= kt[qq[j] * P + j];
-              batch.add(k, 4 * c, c, pid, (uint32_t)(r * 96 + img));
-            }
-          }
-        batch.flush();
-        claimedAll += batch.claimed;
-      });
-    for (auto &t : th) t.join();
-    }
+    forEachKey([&] { return std::make_unique<FinishTable::Batch>(ext, true); },
+               [](FinishTable::Batch &b, uint64_t k, int c, uint8_t pid, uint32_t alg) { b.add(k, 4 * c, c, pid, alg); },
+               [&](FinishTable::Batch &b) { b.flush(); claimedAll += b.claimed; });
     ext.used = claimedAll;
   }
 }

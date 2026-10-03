@@ -29,6 +29,9 @@
 // Structure: everything loaded once (pools, solvers, tables) lives in Res and is
 // read-only during solves; solveOnce() works on a copy of the scrambled cube
 // and keeps all of its state local, so solves can be repeated.
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/resource.h>
+#endif
 #include <deque>
 #include "layout.h"
 #include "merge.h"
@@ -50,6 +53,20 @@
 
 extern std::vector<mv> *g_prep_recorder;
 
+// peak resident set size in MB (0 where unknown)
+static double peakRssMB() {
+#if defined(__APPLE__) || defined(__linux__)
+  struct rusage ru;
+  if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#if defined(__APPLE__)
+  return ru.ru_maxrss / 1048576.0;  // bytes
+#else
+  return ru.ru_maxrss / 1024.0;     // kilobytes
+#endif
+#else
+  return 0;
+#endif
+}
 static double now() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -198,7 +215,16 @@ struct Res {
     double tl = now(), tl0 = tl;
     std::deque<std::string> names;  // default data file paths (stable storage for the const char * below)
     auto D = [&](const char *name) { names.push_back(o.data(name)); return names.back().c_str(); };
-    auto mark = [&](const char *what) { if (getenv("LOADTIME")) fprintf(stderr, "  load %-28s %.2fs\n", what, now() - tl); tl = now(); };
+    // LOADTIME=1: time and peak memory after each step (peak resident set; it only grows during load)
+    double rss0 = peakRssMB();
+    auto mark = [&](const char *what) {
+      if (getenv("LOADTIME")) {
+        const double r = peakRssMB();
+        fprintf(stderr, "  load %-28s %.2fs  peak %6.0f MB (+%.0f)\n", what, now() - tl, r, r - rss0);
+        rss0 = r;
+      }
+      tl = now();
+    };
     bool odd = o.N & 1;
     if (!L.build()) { fprintf(stderr, "layout mapping failed\n"); return false; }
     pairModelR = pairModel();
@@ -258,6 +284,8 @@ struct Res {
       buildFinishFromClassList(finish, finishExt, pairPool, pairBeam.Z, pairSolver.eff4, list, pairModelR);
       pairBeam.finish = &finish;
       mark("pair finish table");
+      if (getenv("LOADTIME")) fprintf(stderr, "    pair finish table: %zu + %zu states in %zu + %zu slots (%.0f + %.0f MB)\n", finish.used, finishExt.used, finish.own.size(), finishExt.own.size(), finish.own.size() * 16 / 1048576.0, finishExt.own.size() * 16 / 1048576.0);
+
     }
     // guaranteed fallbacks: complete 3-cycle tables
     if (!loadAny(pair3Pool, D("pair3.cls"), pairModelR) || !loadAny(diag3Pool, D("diag3.cls"), diagModelR) ||
@@ -278,6 +306,8 @@ struct Res {
       buildFinishFromClasses(diagFinish, diagFinishExt, diagPool, diagBeam.Z, diagSolver.eff4, diagClasses, diagModelR, 10);
       diagBeam.finish = &diagFinish;
       mark("diag finish table");
+      if (getenv("LOADTIME")) fprintf(stderr, "    diag finish table: %zu + %zu states in %zu + %zu slots (%.0f + %.0f MB)\n", diagFinish.used, diagFinishExt.used, diagFinish.own.size(), diagFinishExt.own.size(), diagFinish.own.size() * 16 / 1048576.0, diagFinishExt.own.size() * 16 / 1048576.0);
+
     }
     if (odd) {
       midSolver.build(midPool, nullptr, o.wt);
@@ -289,6 +319,8 @@ struct Res {
         buildFinishFromClasses(midFinish, midFinishExt, midPool, midBeam.Z, midSolver.eff4, midClasses, midModelR, 10);
         midBeam.finish = &midFinish;
         mark("mid finish table");
+      if (getenv("LOADTIME")) fprintf(stderr, "    mid finish table: %zu + %zu states in %zu + %zu slots (%.0f + %.0f MB)\n", midFinish.used, midFinishExt.used, midFinish.own.size(), midFinishExt.own.size(), midFinish.own.size() * 16 / 1048576.0, midFinishExt.own.size() * 16 / 1048576.0);
+
       }
     }
     wingGens.build();
