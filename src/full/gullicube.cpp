@@ -149,6 +149,7 @@ struct Opts {
   int wingFactor = 4;  // wing beam width = this x the -b width
   int wingBeamCost = 7;  // wing class file: beam pool = images up to this many moves
   bool oneMerge = true;  // pairs + diagonals + mids in one merge (quality path)
+  double timeBudget = -1;  // --time: seconds from start (-1: 10 + 50 N/1024; 0: off, plain -b width)
   int mergeBeam = -1;    // merge beam width (0: greedy merge; -1: by merge size, see mergeWith)
   bool pairMerge = false;  // pairwise (greedy-edge) merge instead (merge.h mergePairwise)
   double mergeShare = 0.5;  // greedy merge time budget = share x pair beam time
@@ -911,6 +912,50 @@ static void onSigint(int) {
   std::signal(SIGINT, SIG_DFL);  // a second Ctrl-C kills the process
 }
 
+// Solve time (s) against width, measured whole-cube (gullicube -2, seed 1)
+// on an M3 Max with 16 threads, 2026-10-03: entry k is width 2^k.  The time
+// budget scales this shape to the machine at hand with its probes.
+struct CalRow { int n, k; double t[12]; };
+static const CalRow kTimeCal[] = {
+    {4, 11, {0.02, 0.01, 0.02, 0.04, 0.08, 0.15, 0.29, 0.66, 6.03, 16.51, 23.67}},
+    {6, 11, {0.02, 0.01, 0.03, 0.06, 0.11, 0.22, 0.51, 1.14, 6.18, 18.87, 51.36}},
+    {8, 10, {0.03, 0.02, 0.03, 0.06, 0.12, 0.27, 0.54, 1.19, 6.27, 19.53}},
+    {11, 10, {0.24, 0.04, 0.05, 0.09, 0.15, 0.27, 0.53, 1.27, 7.92, 24.05}},
+    {16, 10, {0.05, 0.04, 0.06, 0.09, 0.14, 0.32, 0.63, 1.49, 9.38, 30.32}},
+    {24, 9, {0.13, 0.12, 0.14, 0.18, 0.25, 0.47, 1.02, 1.95, 10.78}},
+    {32, 9, {0.3, 0.3, 0.34, 0.39, 0.48, 0.78, 1.47, 3.18, 16.53}},
+    {48, 8, {1.04, 1.1, 1.11, 1.24, 1.52, 2.07, 3.31, 8.99}},
+    {64, 8, {1.19, 1.23, 1.28, 1.47, 1.82, 2.72, 4.59, 13.32}},
+    {96, 7, {1.56, 1.13, 1.25, 1.62, 2.34, 4.01, 10.37}},
+    {128, 7, {2.24, 2.3, 2.54, 3.17, 4.47, 7.5, 15.02}},
+    {192, 6, {1.6, 1.84, 2.37, 3.6, 6.26, 11.54}},
+    {256, 6, {2.11, 2.61, 3.75, 6.83, 11.32, 20.73}},
+    {384, 5, {3.76, 5.19, 8.4, 15.16, 28.86}},
+    {512, 4, {6.92, 8.98, 14.8, 26.54}},
+    {1024, 2, {31.99, 39.02}},
+};
+
+// calibrated time at width w for size n: log-log interpolation between widths
+// and between sizes; beyond the last width the last segment's slope (>= 1)
+static double calTime(int n, double w) {
+  auto rowAt = [&](const CalRow &r) {
+    const double lw = std::log2(std::max(1.0, w));
+    int k = std::min((int)lw, r.k - 2);
+    if (r.k == 1) return r.t[0] * w;
+    const double t0 = std::log2(r.t[k]), t1 = std::log2(r.t[k + 1]);
+    double slope = t1 - t0;
+    if (lw > r.k - 1) slope = std::max(1.0, slope);
+    return std::exp2(t0 + slope * (lw - k));
+  };
+  const int R = sizeof kTimeCal / sizeof kTimeCal[0];
+  if (n <= kTimeCal[0].n) return rowAt(kTimeCal[0]);
+  if (n >= kTimeCal[R - 1].n) return rowAt(kTimeCal[R - 1]) * std::pow((double)n / kTimeCal[R - 1].n, 2);
+  int i = 0;
+  while (kTimeCal[i + 1].n < n) i++;
+  const double f = std::log((double)n / kTimeCal[i].n) / std::log((double)kTimeCal[i + 1].n / kTimeCal[i].n);
+  return std::exp((1 - f) * std::log(rowAt(kTimeCal[i])) + f * std::log(rowAt(kTimeCal[i + 1])));
+}
+
 static void usage() {
   fputs(
       "usage: gullicube N [options]      solve a scrambled N x N x N cube (N >= 2)\n"
@@ -926,6 +971,9 @@ static void usage() {
       "    -F              print the start state as a Kociemba facelet string\n"
       "    --seed s        random seed (default: from entropy; the seed used is printed)\n"
       "  search:\n"
+      "    --time s        time budget in seconds from start (default: 10 + 50 N/1024): solves at widths\n"
+      "                    1, 2, 4, ... for about 10% of it, then one final run at the width predicted to\n"
+      "                    fit the rest; the best solve wins.  -b, -2, --fast or --time 0: no budget\n"
       "    -b w            beam width, all phases (with -2: the maximum width)\n"
       "    -2              growing widths until Ctrl-C: the whole cube is re-solved at each width\n"
       "                    (wings at 4x the width, a fresh seed per run); the best solve is kept\n"
@@ -980,6 +1028,7 @@ static void usage() {
 }
 
 int main(int argc, char **argv) {
+  const double tProgram = now();
   if (argc < 2) { usage(); return 1; }
   printf("#");
   for (int i = 0; i < argc; i++) printf(" %s", argv[i]);
@@ -1008,6 +1057,7 @@ int main(int argc, char **argv) {
     else if (a == "-t") o.threads = atoi(argv[++i]);
     else if (a == "-b") { o.width = atoi(argv[++i]); widthGiven = true; }  // beam width, all phases
     else if (a == "-2") o.doubling = true;                // growing widths until Ctrl-C; keep the best per pair
+    else if (a == "--time") o.timeBudget = atof(argv[++i]);  // time budget (s, from start); 0: off
     else if (a == "--grow") o.grow = atof(argv[++i]);     // -2: width growth factor (default 2)
     else if (a == "--reps") o.reps = atoi(argv[++i]);     // -2: runs per width with different table seeds
     else if (a == "--wingwidth") o.wingWidth = atoi(argv[++i]);  // -2: wing beam width (default 16)
@@ -1051,6 +1101,8 @@ int main(int argc, char **argv) {
   }
   if (autoLen) o.scrLen = 50L * o.N;
   if (o.fast && !widthGiven) o.width = 1;
+  // default: a time budget, unless a width, -2, --fast or --time 0 was given
+  const bool timeMode = !widthGiven && !o.doubling && !o.fast && o.timeBudget != 0;
   gMergeThreads = std::max(1, o.threads);
   if (o.fast && !o.finishGiven) o.finish = false;
   // wings: the mined-pool table beam by default, except --fast (thousands of
@@ -1099,7 +1151,59 @@ int main(int argc, char **argv) {
   const bool keep = o.writeMoves || o.verify;
   const int baseRestarts = gMergeRestarts;
   Result best;
-  if (!o.doubling) {
+  if (!o.doubling && timeMode) {
+    // Time budget: solve at widths 1, 2, 4, ... while these probes use about
+    // 10% of the solve budget, then one final run at the widest width the
+    // calibrated time curve (scaled by the last probe) predicts to fit 85% of
+    // what is left.  The best solve wins.
+    const double target = o.timeBudget > 0 ? o.timeBudget : 10.0 + 50.0 * N / 1024.0;
+    const double solveBudget = std::max(0.0, target - (now() - tProgram));
+    printf("# time budget %.1fs from start (load %.1fs): probes up to %.1fs, then one final run\n", target, tLoad,
+           0.1 * solveBudget);
+    auto runSeed = [&](long k) { uint64_t x = (o.seed + k * 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL; return (x ^ (x >> 31)) | 1; };
+    const int maxW = 1 << 16;
+    std::vector<std::pair<int, double>> probes;
+    const double tProbe0 = now();
+    long runNo = 0;
+    auto runAt = [&](int w, const char *what) {
+      uint64_t sd = runSeed(runNo++);
+      R->setSeed(sd);
+      Result r = solveOnce(*R, o, initial, w, nullptr, keep, sd);
+      if (!r.ok) return false;
+      const bool better = !best.ok || r.total() < best.total();
+      printf("  %s width %5d: total %8ld  %.2fs%s\n", what, w, r.total(), r.tTotal, better ? "  best" : "");
+      fflush(stdout);
+      probes.push_back({w, r.tTotal});
+      if (better) best = std::move(r);
+      return true;
+    };
+    // the calibrated curve, scaled to this machine by the last (largest) probe
+    auto predict = [&](int w) {
+      const auto [w1, t1] = probes.back();
+      return calTime(N, w) * (t1 / calTime(N, w1));
+    };
+    int w = 1;
+    if (!runAt(w, "probe")) return 1;
+    while (w < maxW && (now() - tProbe0) + predict(2 * w) <= 0.1 * solveBudget) {
+      w *= 2;
+      if (!runAt(w, "probe")) return 1;
+    }
+    // final run: the widest width predicted to fit 85% of what is left
+    const double left = target - (now() - tProgram);
+    int lo = w, hi = maxW;
+    while (lo < hi) {
+      int mid = lo + (hi - lo + 1) / 2;
+      if (predict(mid) <= 0.85 * left) lo = mid;
+      else hi = mid - 1;
+    }
+    if (lo > w) {
+      printf("  final width %d (predicted %.1fs of %.1fs left)\n", lo, predict(lo), left);
+      if (!runAt(lo, "final")) return 1;
+    }
+    printDetail(o, best);
+    printf("  TOTAL          %6ld moves   (load %.1fs, corners %.2fs, wall %.3fs; time-budget run %.1fs of %.1fs)\n",
+           best.total(), tLoad, best.tCorners, best.tTotal, now() - tProgram, target);
+  } else if (!o.doubling) {
     R->setSeed(o.seed);
     best = solveOnce(*R, o, initial, o.width, nullptr, keep, o.seed | 1);
     if (!best.ok) return 1;
@@ -1130,8 +1234,8 @@ int main(int argc, char **argv) {
           Result r = solveOnce(*R, o, initial, w, stop, keep, sd);
           if (r.aborted || !r.ok) { gStop = true; break; }
           bool better = !best.ok || r.total() < best.total();
-          printf("  width %5d: total %8ld  (edges %ld, corners+middle edges %ld, centres %ld)  %.2fs%s\n", w, r.total(),
-                 r.wings, r.corners, r.pairs + r.diagmid, r.tTotal, better ? "  best" : "");
+          printf("  width %5d: total %8ld  (edges %ld, corners+middle edges %ld, centres %ld)  %.2fs, %.1fs since start%s\n", w,
+                 r.total(), r.wings, r.corners, r.pairs + r.diagmid, r.tTotal, now() - tProgram, better ? "  best" : "");
           fflush(stdout);
           if (better) best = std::move(r);
         }
@@ -1174,8 +1278,8 @@ int main(int argc, char **argv) {
       if (r.aborted || !r.ok) { gStop = true; break; }
       bool better = !best.ok || r.total() < best.total();
       printf("  width %5d: pairs this width %10ld, best-of %10ld (%ld pairs improved)  total %10ld  (edges %ld, "
-             "corners+middle edges %ld, centres %ld)  %.2fs%s\n",
-             w, thisW, combined, improved, r.total(), r.wings, r.corners, r.pairs + r.diagmid, now() - ts,
+             "corners+middle edges %ld, centres %ld)  %.2fs, %.1fs since start%s\n",
+             w, thisW, combined, improved, r.total(), r.wings, r.corners, r.pairs + r.diagmid, now() - ts, now() - tProgram,
              better ? "  best" : "");
       fflush(stdout);
       if (better) best = std::move(r);

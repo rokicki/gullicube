@@ -13,6 +13,7 @@
 // effcost charges face-turn setup moves (the X of X c X') at a discount, since
 // those mostly cancel when many orbit solutions are merged.
 #pragma once
+#include "mintree.h"
 #include "../pair/pool.h"
 #include "../pair/eg2.h"
 #include <unordered_set>
@@ -744,6 +745,7 @@ struct TableBeam {
       if (level.empty()) level = {0};
     }
     std::vector<Slot> table(TS);
+    MinTree minTree;
     int best4 = 1 << 30, bestNode = -1;
     long bestAlg = -1;
     const FinishTable::Slot *bestFin = nullptr;
@@ -796,6 +798,7 @@ struct TableBeam {
               : widthGrowth != 1 ? (int)std::min<double>(widthCap, std::max(1.0, TS * std::pow(widthGrowth, depth))) : TS;
       table.resize(curTS);
       for (auto &sl : table) sl.score = INT32_MIN;
+      minTree.reset(curTS);
       int filled = 0, weakest = INT32_MIN;  // weakest score in the table once every slot is filled
       for (int ni : level) {
         const Node &nd = nodes[ni];
@@ -882,15 +885,16 @@ struct TableBeam {
             sc -= heur->extra4(nd.s.apply(pool, a));
             if (sc < weakest) return;
           }
-          Slot &sl = table[slotOf(h)];
+          const size_t si = slotOf(h);
+          Slot &sl = table[si];
           if (sl.score == INT32_MIN) filled++;
           else if (sc < sl.score) return;
           else if (sc == sl.score && tieKey(h) >= tieKey(sl.h)) return;  // seeded tie-break: runs differ even at width 1
           sl = {sc, ni, (uint32_t)a, g4, h, ntail};
+          minTree.set(si, sc);
           if (filled == curTS) {  // admission threshold: weakest slot
-            weakest = INT32_MAX;
             if (timing) nWeakScan++;
-            for (auto &t : table) weakest = std::min(weakest, t.score);
+            weakest = minTree.min();
           }
         };
         if (useIndex) {

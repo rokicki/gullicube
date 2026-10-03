@@ -25,6 +25,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "mintree.h"
 
 struct WingPool {
   std::vector<std::array<uint8_t, 24>> src;
@@ -203,6 +204,7 @@ struct WingTableBeam {
     std::vector<uint64_t> seen(SEEN, 0);
     seen[nodes[0].h & (SEEN - 1)] = nodes[0].h;
     std::vector<Slot> table(TS);
+    MinTree minTree;
     int best4 = 1 << 30, bestNode = -1;
     long bestFin = -1;  // finishing algorithm after bestNode (or -1)
     long bestFinAlg = -1;  // algorithm between bestNode and the finish (-1: none)
@@ -212,6 +214,7 @@ struct WingTableBeam {
     for (int depth = 0; depth < 200 && !level.empty(); depth++) {
       if (stop && stop->load(std::memory_order_relaxed)) return {};
       for (auto &s : table) s.score = INT32_MIN;
+      minTree.reset(TS);
       int filled = 0, weakest = INT32_MIN;
       for (int ni : level) {
         const Node &nd = nodes[ni];
@@ -267,14 +270,13 @@ struct WingTableBeam {
             int fc4 = f >= 0 ? 4 * (finPool->cost[f] + seam(ntail, finPool->firstG[f], mg)) : 0;
             if (f >= 0 && g4 + fc4 < best4) { best4 = g4 + fc4; bestNode = ni; bestFin = f; bestFinAlg = a; }
           }
-          Slot &sl = table[slotOf(h)];
+          const size_t si = slotOf(h);
+          Slot &sl = table[si];
           if (sl.score == INT32_MIN) filled++;
           else if (sc < sl.score || (sc == sl.score && tieKey(h) >= tieKey(sl.h))) return;
           sl = {sc, ni, (uint32_t)a, g4, h, ntail};
-          if (filled == TS) {
-            weakest = INT32_MAX;
-            for (auto &t : table) weakest = std::min(weakest, t.score);
-          }
+          minTree.set(si, sc);
+          if (filled == TS) weakest = minTree.min();
         };
         if (rejp) {
           for (size_t w = 0; w < nw; w++)
