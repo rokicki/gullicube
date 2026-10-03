@@ -58,10 +58,33 @@ static double now() {
 // Merge with the beam or greedily: the beam's cost grows about as
 // instances^2 x width while its gain shrinks for large merges (measured: -3%
 // at 10^3 and 16^3 with width 256; -1% at 64^3 at 30x the time).
+static bool gPairMerge = false;  // --pairmerge
 static std::vector<mv> mergeWith(Merger &mg, int beamOpt, long &raw, long &merged, std::vector<int> *order = nullptr,
-                                 double budget = 0) {
+                                 double budget = 0, const char *what = "") {
   size_t n = mg.insts.size();
+  if (const char *dump = getenv("MERGEDUMP")) {  // experiment: write the merge input (devtools/mergebound)
+    static std::atomic<int> seq{0};
+    std::string fn = std::string(dump) + "-" + std::to_string(seq++) + "-" + what + ".txt";
+    if (FILE *f = fopen(fn.c_str(), "w")) {
+      fprintf(f, "# merge %s N %d instances %zu\n", what, mg.N, n);
+      for (auto &in : mg.insts) {
+        fprintf(f, "%zu", in.deps.size());
+        for (auto &d : in.deps) fprintf(f, " %d %llx", d.first, (unsigned long long)d.second);
+        fprintf(f, " %zu", in.moves.size());
+        for (auto &m : in.moves) fprintf(f, " %d %d %d", m.axis, m.pos, m.amt);
+        fprintf(f, "\n");
+      }
+      fclose(f);
+    }
+  }
   mg.budget = budget;
+  if (gPairMerge) {
+    mg.budget = budget;
+    double t0 = now();
+    auto r = mg.mergePairwise(raw, merged, order);
+    if (getenv("MERGETIME")) fprintf(stderr, "  merge %s: %zu instances, pairwise: %.3fs\n", what, n, now() - t0);
+    return r;
+  }
   int w = beamOpt >= 0 ? beamOpt : n <= 400 ? 256 : n <= 1500 ? 64 : 0;
   // the merge beam costs about n^2 x width x 9e-8 s (measured): fit the width to the budget
   if (beamOpt < 0 && budget > 0)
@@ -113,6 +136,7 @@ struct Opts {
   int wingBeamCost = 7;  // wing class file: beam pool = images up to this many moves
   bool oneMerge = true;  // pairs + diagonals + mids in one merge (quality path)
   int mergeBeam = -1;    // merge beam width (0: greedy merge; -1: by merge size, see mergeWith)
+  bool pairMerge = false;  // pairwise (greedy-edge) merge instead (merge.h mergePairwise)
   double mergeShare = 0.5;  // greedy merge time budget = share x pair beam time
   bool seam = true;      // pair/diag/mid beams: seam-aware costs (measured: -1% quality, -4.8% --fast)
   bool whole = true;  // -2: re-solve the whole cube (wings too) at every width, keep the best whole solve
@@ -606,7 +630,7 @@ static Result finishCentres(const Res &R, const Opts &o, const EdgesOut &E, cons
         fprintf(stderr, "MERGESTAT pairs: %zu algorithm instances, %ld raw moves, %ld face turns\n", mg.insts.size(), all, faces);
       }
       mg.stop = stop;
-      seq = mergeWith(mg, o.mergeBeam, res.pairsRaw, res.pairs, &pairOrder, mergeBudget);
+      seq = mergeWith(mg, o.mergeBeam, res.pairsRaw, res.pairs, &pairOrder, mergeBudget, "pairs");
       if (stopped()) { res.aborted = true; return res; }
       pairInst = solutionOrder();  // instance index -> (pair, algorithm)
       pairsMerged1 = res.pairs;
@@ -727,7 +751,7 @@ static Result finishCentres(const Res &R, const Opts &o, const EdgesOut &E, cons
         res.diagmidRaw = res.diagmid = seq.size();
       } else {
         mg.stop = stop;
-        seq = mergeWith(mg, o.mergeBeam, res.diagmidRaw, res.diagmid, nullptr, mergeBudget);
+        seq = mergeWith(mg, o.mergeBeam, res.diagmidRaw, res.diagmid, nullptr, mergeBudget, "diagmid");
         if (stopped()) { res.aborted = true; return res; }
       }
       if (one) {
@@ -767,7 +791,7 @@ static Result finishCentres(const Res &R, const Opts &o, const EdgesOut &E, cons
           }
         all.stop = stop;
         long raw, merged;
-        auto seqAll = mergeWith(all, o.mergeBeam, raw, merged, nullptr, mergeBudget);
+        auto seqAll = mergeWith(all, o.mergeBeam, raw, merged, nullptr, mergeBudget, "all");
         if (stopped()) { res.aborted = true; return res; }
         if (merged < pairsMerged1 + res.diagmid) {  // the combined merge is shorter: use it
           if (replay) cube = *cubeBeforePairs;
@@ -900,6 +924,7 @@ static void usage() {
       "    --mergeshare f  greedy merge time budget = f x the pair beam time (default 0.5; 0 = unlimited)\n"
       "    --mergebeam w   merge with a beam of width w instead of the greedy merge (0: greedy;\n"
       "                    default: 256 up to 400 algorithm instances, 64 up to 1500, else greedy)\n"
+      "    --pairmerge     pairwise (greedy-edge) merge instead of the merge beam / greedy merge\n"
       "    --seam/--noseam pair/diagonal/mid beams: cost minus moves cancelling with the previous\n"
       "                    algorithm (default on)\n"
       "    --finish        pair finish table: every beam child one algorithm from solved is seen\n"
@@ -994,6 +1019,7 @@ int main(int argc, char **argv) {
     else if (a == "--seam") o.seam = true;                   // pair/diag/mid beams: seam-aware costs
     else if (a == "--onemerge") o.oneMerge = true;           // pairs + diagonals + mids merged together
     else if (a == "--twomerge") o.oneMerge = false;          // pairs merged, then diagonals + mids
+    else if (a == "--pairmerge") o.pairMerge = gPairMerge = true;  // pairwise merge (experimental)
     else if (a == "--mergebeam") o.mergeBeam = atoi(argv[++i]);  // merge beam width (0: greedy; default by size)
     else if (a == "--mergeshare") o.mergeShare = atof(argv[++i]);  // merge time budget / pair beam time
     else if (a == "--noseam") o.seam = false;

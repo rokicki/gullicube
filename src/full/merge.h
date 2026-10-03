@@ -19,6 +19,8 @@
 #include <atomic>
 #include <chrono>
 #include <unordered_map>
+#include <queue>
+#include <tuple>
 
 struct PLayer { int8_t axis; int16_t pos; int8_t amt; };
 
@@ -259,7 +261,284 @@ class Merger {
     return out;
   }
 
+
+  // Pairwise merge (greedy edge, like building a Huffman tree): every
+  // instance starts as a piece of its own; repeatedly the best seam anywhere
+  // -- the end of one piece followed by the start of another -- joins the two
+  // pieces, as long as the order constraints still allow some order.  Then
+  // the pieces are laid out in an order the constraints allow.
+  //  - Seam savings are exact from instance to instance (the last instance of
+  //    one piece, the first of the other): same-axis groups meet at the seam,
+  //    and when both cancel completely the next groups inward meet, and so
+  //    on.  The final sequence is built and costed exactly.
+  //  - Each piece end keeps its best seam (from the (axis, layer, twist)
+  //    buckets of first groups, at most pairLim candidates scanned) in a heap;
+  //    a stale best is recomputed when it reaches the top.
+  //  - Pieces keep a topological order under the constraints (Pearce-Kelly).
+  //    A seam P -> Q ("immediately before") is refused if a constraint path
+  //    leads from Q to P, or from P to Q through another piece; both searches
+  //    stay between P and Q in the order.  An accepted seam reorders only that
+  //    region.  A search past pairVisitCap pieces refuses the seam (safe).
+  int pairLim = 256;
+  int pairVisitCap = 64;  // measured at 128^3: 64 costs 0.6% against 4096, at half the time
+  // with `budget` (seconds, shared with merge()): every 1024 heap steps the
+  // finish time is projected from the joins so far; over budget, the scan
+  // limit and search cap halve (down to 8); over twice the budget once at
+  // the minimum, joining stops and the pieces so far are laid out.
+  long pairStatJoins = 0, pairStatRejected = 0, pairStatCapped = 0, pairStatVisits = 0, pairStatEdges = 0, pairStatScored = 0, pairStatEdgesOk = 0;
+  std::vector<mv> mergePairwise(long &rawMoves, long &mergedMoves, std::vector<int> *order = nullptr) {
+    if (order) order->clear();
+    const int n = insts.size();
+    rawMoves = 0;
+    for (auto &in : insts) rawMoves += in.moves.size();
+    // order constraints (as merge() builds them), both directions, per instance
+    std::vector<std::vector<int>> outs(n), ins(n);
+    {
+      std::vector<std::vector<std::pair<int, uint64_t>>> comp;
+      for (int i = 0; i < n; i++)
+        for (auto &d : insts[i].deps) {
+          if ((int)comp.size() <= d.first) comp.resize(d.first + 1);
+          for (auto &prev : comp[d.first])
+            if (prev.second & d.second) { outs[prev.first].push_back(i); ins[i].push_back(prev.first); }
+          comp[d.first].push_back({i, d.second});
+        }
+    }
+    // same-axis groups of each instance: moves [goff[g], goff[g+1]) for g in [gbeg[i], gbeg[i+1])
+    std::vector<int> gbeg(n + 1), goff;
+    for (int i = 0; i < n; i++) {
+      gbeg[i] = goff.size();
+      const auto &m = insts[i].moves;
+      for (size_t k = 0; k < m.size(); k++)
+        if (k == 0 || m[k].axis != m[k - 1].axis) goff.push_back(k);
+    }
+    gbeg[n] = goff.size();
+    goff.push_back(0);  // sentinel (unused)
+    auto gEnd = [&](int i, int g) { return g + 1 < gbeg[i + 1] ? goff[g + 1] : (int)insts[i].moves.size(); };
+    // exact saving of j directly after i
+    auto seamSave = [&](int i, int j) {
+      const auto &a = insts[i].moves, &b = insts[j].moves;
+      int save = 0;
+      for (int gi = gbeg[i + 1] - 1, gj = gbeg[j]; gi >= gbeg[i] && gj < gbeg[j + 1]; gi--, gj++) {
+        const int a0 = goff[gi], a1 = gEnd(i, gi), b0 = goff[gj], b1 = gEnd(j, gj);
+        if (a[a0].axis != b[b0].axis) break;
+        int cancelled = 0;
+        for (int h = b0; h < b1; h++)
+          for (int t = a0; t < a1; t++)
+            if (a[t].pos == b[h].pos) {
+              if (((a[t].amt + b[h].amt) & 3) == 0) { save += 2; cancelled++; }
+              else save += 1;
+              break;
+            }
+        if (cancelled != a1 - a0 || cancelled != b1 - b0) break;  // a group survives: the cascade stops
+      }
+      return save;
+    };
+    // pieces: union-find; at the root, head and tail instance and its place in the order
+    std::vector<int> parent(n), phead(n), ptail(n), succ(n, -1), pred(n, -1), ord(n);
+    std::vector<size_t> outsKept(n, 0), insKept(n, 0);
+    for (int i = 0; i < n; i++) parent[i] = phead[i] = ptail[i] = ord[i] = i;  // constraints go forward in index
+    auto find = [&](int x) {
+      while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+      return x;
+    };
+    // buckets of piece heads by (axis, layer, twist) of their first group
+    auto bkey = [&](int axis, int pos, int amt) { return ((size_t)axis * (N + 2) + pos) * 4 + amt; };
+    std::vector<std::vector<int>> bucket(3 * (size_t)(N + 2) * 4);
+    for (int j = 0; j < n; j++)
+      if (gbeg[j] < gbeg[j + 1])
+        for (int h = goff[gbeg[j]]; h < gEnd(j, gbeg[j]); h++) {
+          const auto &p = insts[j].moves[h];
+          bucket[bkey(p.axis, p.pos, p.amt)].push_back(j);
+        }
+    std::vector<std::vector<int>> rejected(n);  // per tail instance: heads refused by the constraints
+    auto bestFrom = [&](int i) {
+      int best = 0, bj = -1, evaluated = 0;
+      if (gbeg[i] == gbeg[i + 1]) return std::make_pair(0, -1);
+      const auto &a = insts[i].moves;
+      const int ri = find(i), g = gbeg[i + 1] - 1;
+      for (int pass = 0; pass < 2 && evaluated < pairLim; pass++)  // pass 0: cancelling twists first
+        for (int t = goff[g]; t < gEnd(i, g) && evaluated < pairLim; t++)
+          for (int amt = 1; amt <= 3 && evaluated < pairLim; amt++) {
+            if ((((a[t].amt + amt) & 3) == 0) != (pass == 0)) continue;
+            auto &v = bucket[bkey(a[t].axis, a[t].pos, amt)];
+            for (size_t k = v.size(); k-- > 0 && evaluated < pairLim;) {
+              const int j = v[k];
+              if (pred[j] >= 0) { v[k] = v.back(); v.pop_back(); continue; }  // no longer a head
+              if (find(j) == ri) continue;
+              if (std::find(rejected[i].begin(), rejected[i].end(), j) != rejected[i].end()) continue;
+              evaluated++;
+              pairStatScored++;
+              const int s = seamSave(i, j);
+              if (s > best || (s == best && s > 0 && j < bj)) { best = s; bj = j; }
+            }
+          }
+      return std::make_pair(best, bj);
+    };
+    // amortized compaction of a root's edge list: roots, no self, no repeats
+    std::vector<int> stamp(n, 0);
+    int gen = 0;
+    auto compact = [&](std::vector<int> &L, size_t &kept, int self) {
+      if (L.size() <= 2 * kept + 16) return;
+      gen++;
+      size_t w = 0;
+      for (int x : L) {
+        int q = find(x);
+        if (q == self || stamp[q] == gen) continue;
+        stamp[q] = gen;
+        L[w++] = q;
+      }
+      L.resize(w);
+      kept = w;
+    };
+    // seam P -> Q (roots): 0 refused, 1 accepted (and the order updated), -1 cap
+    std::vector<int> Fset, Bset, stack, slots;
+    auto tryJoin = [&](int P, int Q) {
+      const int lo = std::min(ord[P], ord[Q]), hi = std::max(ord[P], ord[Q]);
+      const int L = ord[P] < ord[Q] ? P : Q, Hn = L == P ? Q : P;
+      int visits = 0;
+      long edgesHere = 0;
+      // forward from L inside (lo, hi): reaching Hn is a contradiction, except
+      // the direct edge P -> Q
+      gen++;
+      Fset.clear();
+      stack.assign(1, L);
+      stamp[L] = gen;
+      while (!stack.empty()) {
+        int r = stack.back();
+        stack.pop_back();
+        if (++visits > pairVisitCap) return -1;
+        pairStatEdges += outs[r].size();
+        edgesHere += outs[r].size();
+        for (int x : outs[r]) {
+          int q = find(x);
+          if (q == r || stamp[q] == gen) continue;
+          if (q == Hn) {
+            if (r == P && L == P) continue;  // direct P -> Q: fine
+            return 0;
+          }
+          if (ord[q] > hi) continue;
+          stamp[q] = gen;
+          Fset.push_back(q);
+          stack.push_back(q);
+        }
+      }
+      // backward from Hn inside (lo, hi)
+      Bset.clear();
+      stack.assign(1, Hn);
+      stamp[Hn] = gen;
+      while (!stack.empty()) {
+        int r = stack.back();
+        stack.pop_back();
+        if (++visits > pairVisitCap) return -1;
+        pairStatEdges += ins[r].size();
+        edgesHere += ins[r].size();
+        for (int x : ins[r]) {
+          int q = find(x);
+          if (q == r || q == L || stamp[q] == gen) continue;  // stamp: also skips F (disjoint by now)
+          if (ord[q] < lo) continue;
+          stamp[q] = gen;
+          Bset.push_back(q);
+          stack.push_back(q);
+        }
+      }
+      pairStatVisits += visits;
+      pairStatEdgesOk += edgesHere;
+      // new order in the region: B, the joined piece, F (each keeping its order)
+      slots.clear();
+      for (int q : Bset) slots.push_back(ord[q]);
+      for (int q : Fset) slots.push_back(ord[q]);
+      slots.push_back(ord[P]);
+      slots.push_back(ord[Q]);
+      std::sort(slots.begin(), slots.end());
+      auto byOrd = [&](int x, int y) { return ord[x] < ord[y]; };
+      std::sort(Bset.begin(), Bset.end(), byOrd);
+      std::sort(Fset.begin(), Fset.end(), byOrd);
+      size_t k = 0;
+      for (int q : Bset) ord[q] = slots[k++];
+      const int joinedOrd = slots[k++];
+      k++;  // a spare slot
+      for (int q : Fset) ord[q] = slots[k++];
+      // contract
+      int big = outs[P].size() + ins[P].size() >= outs[Q].size() + ins[Q].size() ? P : Q, small = big == P ? Q : P;
+      parent[small] = big;
+      outs[big].insert(outs[big].end(), outs[small].begin(), outs[small].end());
+      ins[big].insert(ins[big].end(), ins[small].begin(), ins[small].end());
+      std::vector<int>().swap(outs[small]);
+      std::vector<int>().swap(ins[small]);
+      compact(outs[big], outsKept[big], big);
+      compact(ins[big], insKept[big], big);
+      ord[big] = joinedOrd;
+      phead[big] = phead[P];
+      ptail[big] = ptail[Q];
+      return 1;
+    };
+    using E = std::tuple<int, int, int>;  // (save, -i, j): highest save, then lowest i
+    std::priority_queue<E> heap;
+    for (int i = 0; i < n; i++) {
+      auto [s, j] = bestFrom(i);
+      if (j >= 0) heap.push({s, -i, j});
+    }
+    long steps = 0;
+    const auto tStart = std::chrono::steady_clock::now();
+    const long joinsMax = n;  // at most n - 1 joins; projection by joins done
+    while (!heap.empty()) {
+      if ((++steps & 1023) == 0) {
+        if (stop && stop->load(std::memory_order_relaxed)) break;
+        if (budget > 0 && pairStatJoins > 0) {
+          double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - tStart).count();
+          double proj = el * joinsMax / pairStatJoins;
+          if (proj > budget && (pairLim > 8 || pairVisitCap > 8)) { pairLim = std::max(8, pairLim / 2); pairVisitCap = std::max(8, pairVisitCap / 2); }
+          else if (pairLim <= 8 && pairVisitCap <= 8 && el > 2 * budget) break;
+        }
+      }
+      auto [s, mi, j] = heap.top();
+      heap.pop();
+      const int i = -mi;
+      if (succ[i] >= 0) continue;  // no longer a piece end
+      const int P = find(i), Q = find(j);
+      if (pred[j] >= 0 || P == Q) {  // stale target: look again
+        auto [s2, j2] = bestFrom(i);
+        if (j2 >= 0) heap.push({s2, -i, j2});
+        continue;
+      }
+      const int ok = tryJoin(P, Q);
+      if (ok != 1) {
+        pairStatRejected++;
+        if (ok < 0) pairStatCapped++;
+        rejected[i].push_back(j);
+        auto [s2, j2] = bestFrom(i);
+        if (j2 >= 0) heap.push({s2, -i, j2});
+        continue;
+      }
+      pairStatJoins++;
+      succ[i] = j;
+      pred[j] = i;
+      const int ti = ptail[find(i)];  // the new piece end looks for its best seam
+      auto [s2, j2] = bestFrom(ti);
+      if (j2 >= 0) heap.push({s2, -ti, j2});
+    }
+    // lay out the pieces in their topological order
+    std::vector<int> roots;
+    for (int i = 0; i < n; i++) if (find(i) == i) roots.push_back(i);
+    std::sort(roots.begin(), roots.end(), [&](int x, int y) { return ord[x] < ord[y]; });
+    std::vector<int> seq;
+    for (int r : roots)
+      for (int x = phead[r]; x >= 0; x = succ[x]) seq.push_back(x);
+    if ((int)seq.size() != n) { long r, m; return merge(r, m, order); }  // cannot happen; be safe
+    tail.clear();
+    cost = 0;
+    for (int i : seq)
+      for (auto &p : insts[i].moves) push(tail, cost, p);
+    mergedMoves = cost;
+    if (order) *order = seq;
+    std::vector<mv> out;
+    for (auto &g : tail)
+      for (auto &l : g.layers) out.push_back(toMove({g.axis, l.first, l.second}));
+    return out;
+  }
+
   std::vector<MergeInst> insts;
+  int N;
   const std::atomic<bool> *stop = nullptr;  // checked every 4096 merge steps
 
  private:
@@ -267,7 +546,6 @@ class Merger {
     int8_t axis;
     std::vector<std::pair<int16_t, int8_t>> layers;  // (pos, amount), amount != 0
   };
-  int N;
   std::vector<Group> tail;
   long cost = 0;
 
