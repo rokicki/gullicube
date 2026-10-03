@@ -280,12 +280,18 @@ class Merger {
   //    stay between P and Q in the order.  An accepted seam reorders only that
   //    region.  A search past pairVisitCap pieces refuses the seam (safe).
   int pairLim = 256;
-  int pairVisitCap = 64;  // measured at 128^3: 64 costs 0.6% against 4096, at half the time
+  int pairVisitCap = 64;
+  int pairWindow = 0;
+  // restarts: with pairSeed != 0, equal seams are taken in a seeded random
+  // order, and pairNoise (eighths of a move) of seeded noise is added to each
+  // seam's priority; the joins themselves stay exact
+  uint64_t pairSeed = 0;
+  int pairNoise = 0;     // experiment: refuse seams between pieces further apart in the order (0: off)  // measured at 128^3: 64 costs 0.6% against 4096, at half the time
   // with `budget` (seconds, shared with merge()): every 1024 heap steps the
   // finish time is projected from the joins so far; over budget, the scan
   // limit and search cap halve (down to 8); over twice the budget once at
   // the minimum, joining stops and the pieces so far are laid out.
-  long pairStatJoins = 0, pairStatRejected = 0, pairStatCapped = 0, pairStatVisits = 0, pairStatEdges = 0, pairStatScored = 0, pairStatEdgesOk = 0;
+  long pairStatJoins = 0, pairStatRejected = 0, pairStatCapped = 0, pairStatVisits = 0, pairStatEdges = 0, pairStatScored = 0, pairStatEdgesOk = 0, pairStatRefDirect = 0, pairStatRefLong = 0, pairStatRefBetween = 0;
   std::vector<mv> mergePairwise(long &rawMoves, long &mergedMoves, std::vector<int> *order = nullptr) {
     if (order) order->clear();
     const int n = insts.size();
@@ -351,6 +357,16 @@ class Merger {
           bucket[bkey(p.axis, p.pos, p.amt)].push_back(j);
         }
     std::vector<std::vector<int>> rejected(n);  // per tail instance: heads refused by the constraints
+    auto mix = [&](uint64_t x) {
+      x += pairSeed * 0x9E3779B97F4A7C15ULL;
+      x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ULL; x ^= x >> 29; x *= 0x94D049BB133111EBULL; x ^= x >> 32;
+      return x;
+    };
+    auto tieJ = [&](int j) -> uint64_t { return j < 0 ? ~0ULL : pairSeed ? mix(j) : (uint64_t)j; };
+    // heap priority of a seam: 8 x saving, plus seeded noise
+    auto prio = [&](int s, int i, int j) {
+      return 8 * s + (pairSeed && pairNoise ? (int)(mix(((uint64_t)i << 32) ^ (uint32_t)j ^ 0x5555) % (pairNoise + 1)) : 0);
+    };
     auto bestFrom = [&](int i) {
       int best = 0, bj = -1, evaluated = 0;
       if (gbeg[i] == gbeg[i + 1]) return std::make_pair(0, -1);
@@ -369,7 +385,7 @@ class Merger {
               evaluated++;
               pairStatScored++;
               const int s = seamSave(i, j);
-              if (s > best || (s == best && s > 0 && j < bj)) { best = s; bj = j; }
+              if (s > best || (s == best && s > 0 && tieJ(j) < tieJ(bj))) { best = s; bj = j; }
             }
           }
       return std::make_pair(best, bj);
@@ -394,6 +410,7 @@ class Merger {
     std::vector<int> Fset, Bset, stack, slots;
     auto tryJoin = [&](int P, int Q) {
       const int lo = std::min(ord[P], ord[Q]), hi = std::max(ord[P], ord[Q]);
+      if (pairWindow > 0 && hi - lo > pairWindow) return 0;
       const int L = ord[P] < ord[Q] ? P : Q, Hn = L == P ? Q : P;
       int visits = 0;
       long edgesHere = 0;
@@ -414,6 +431,9 @@ class Merger {
           if (q == r || stamp[q] == gen) continue;
           if (q == Hn) {
             if (r == P && L == P) continue;  // direct P -> Q: fine
+            if (L == P) pairStatRefBetween++;       // P ~> X ~> Q
+            else if (r == Q) pairStatRefDirect++;   // Q -> P directly
+            else pairStatRefLong++;                 // Q ~> X ~> P
             return 0;
           }
           if (ord[q] > hi) continue;
@@ -472,11 +492,12 @@ class Merger {
       ptail[big] = ptail[Q];
       return 1;
     };
-    using E = std::tuple<int, int, int>;  // (save, -i, j): highest save, then lowest i
+    using E = std::tuple<int, int64_t, int, int>;  // (priority, tie, i, j): highest priority, then tie
+    auto tieI = [&](int i) -> int64_t { return pairSeed ? (int64_t)(mix(~(uint64_t)i) >> 1) : -(int64_t)i; };
     std::priority_queue<E> heap;
     for (int i = 0; i < n; i++) {
       auto [s, j] = bestFrom(i);
-      if (j >= 0) heap.push({s, -i, j});
+      if (j >= 0) heap.push({prio(s, i, j), tieI(i), i, j});
     }
     long steps = 0;
     const auto tStart = std::chrono::steady_clock::now();
@@ -491,14 +512,13 @@ class Merger {
           else if (pairLim <= 8 && pairVisitCap <= 8 && el > 2 * budget) break;
         }
       }
-      auto [s, mi, j] = heap.top();
+      auto [pr, tie, i, j] = heap.top();
       heap.pop();
-      const int i = -mi;
       if (succ[i] >= 0) continue;  // no longer a piece end
       const int P = find(i), Q = find(j);
       if (pred[j] >= 0 || P == Q) {  // stale target: look again
         auto [s2, j2] = bestFrom(i);
-        if (j2 >= 0) heap.push({s2, -i, j2});
+        if (j2 >= 0) heap.push({prio(s2, i, j2), tieI(i), i, j2});
         continue;
       }
       const int ok = tryJoin(P, Q);
@@ -507,7 +527,7 @@ class Merger {
         if (ok < 0) pairStatCapped++;
         rejected[i].push_back(j);
         auto [s2, j2] = bestFrom(i);
-        if (j2 >= 0) heap.push({s2, -i, j2});
+        if (j2 >= 0) heap.push({prio(s2, i, j2), tieI(i), i, j2});
         continue;
       }
       pairStatJoins++;
@@ -515,7 +535,7 @@ class Merger {
       pred[j] = i;
       const int ti = ptail[find(i)];  // the new piece end looks for its best seam
       auto [s2, j2] = bestFrom(ti);
-      if (j2 >= 0) heap.push({s2, -ti, j2});
+      if (j2 >= 0) heap.push({prio(s2, ti, j2), tieI(ti), ti, j2});
     }
     // lay out the pieces in their topological order
     std::vector<int> roots;
@@ -537,18 +557,240 @@ class Merger {
     return out;
   }
 
+
+  // ---------------------------------------------------------------- best merge
+  // Constraints as merge() builds them: pr[i] must precede i, su[i] follow it.
+  void constraints(std::vector<std::vector<int>> &pr, std::vector<std::vector<int>> &su) const {
+    const int n = insts.size();
+    pr.assign(n, {});
+    su.assign(n, {});
+    std::vector<std::vector<std::pair<int, uint64_t>>> comp;
+    for (int i = 0; i < n; i++)
+      for (auto &d : insts[i].deps) {
+        if ((int)comp.size() <= d.first) comp.resize(d.first + 1);
+        for (auto &p : comp[d.first])
+          if (p.second & d.second) { pr[i].push_back(p.first); su[p.first].push_back(i); }
+        comp[d.first].push_back({i, d.second});
+      }
+  }
+  // exact merged cost of an order
+  long orderCost(const std::vector<int> &ord) const {
+    std::vector<Group> t;
+    long c = 0;
+    for (int i : ord)
+      for (auto &p : insts[i].moves) push(t, c, p);
+    return c;
+  }
+  // Levels: each instance on the latest level its successors allow; each
+  // level merged pairwise (no constraints inside a level); levels in order.
+  std::vector<int> levelsOrder() const {
+    const int n = insts.size();
+    std::vector<std::vector<int>> pr, su;
+    constraints(pr, su);
+    std::vector<int> lev(n, 0), out;
+    int L = 0;
+    for (int i = n - 1; i >= 0; i--) {
+      for (int s : su[i]) lev[i] = std::max(lev[i], lev[s] + 1);
+      L = std::max(L, lev[i]);
+    }
+    std::vector<std::vector<int>> byLev(L + 1);
+    for (int i = 0; i < n; i++) byLev[L - lev[i]].push_back(i);
+    for (auto &ids : byLev) {
+      Merger m(N);
+      for (int i : ids) { MergeInst J; J.moves = insts[i].moves; m.insts.push_back(std::move(J)); }
+      long r, x;
+      std::vector<int> o;
+      m.mergePairwise(r, x, &o);
+      for (int k : o) out.push_back(ids[k]);
+    }
+    return out;
+  }
+  // Local improvement of an order: move a run of 1..maxRun consecutive
+  // instances to just after a partner its first instance seams with, or just
+  // before a partner its last instance seams with (partners from buckets of
+  // first / last groups, candLim each way), when every predecessor stays
+  // before the run and every successor after it (order labels) and the
+  // pairwise seam savings rise.  Passes until nothing gains (at most maxPass).
+  int impRun = 3, impPass = 20, impCand = 64;
+  std::vector<int> improveOrder(const std::vector<int> &start) const {
+    const int n = insts.size();
+    if (n < 2) return start;
+    std::vector<std::vector<int>> pr, su;
+    constraints(pr, su);
+    std::vector<std::vector<int>> goff(n);
+    for (int i = 0; i < n; i++) {
+      const auto &m = insts[i].moves;
+      for (size_t k = 0; k < m.size(); k++)
+        if (k == 0 || m[k].axis != m[k - 1].axis) goff[i].push_back(k);
+      goff[i].push_back(m.size());
+    }
+    auto save = [&](int i, int j) {
+      if (i < 0 || j < 0) return 0;
+      const auto &A = insts[i].moves, &B = insts[j].moves;
+      const auto &ga = goff[i], &gb = goff[j];
+      int s = 0;
+      for (int gi = (int)ga.size() - 2, gj = 0; gi >= 0 && gj + 1 < (int)gb.size(); gi--, gj++) {
+        const int a0 = ga[gi], a1 = ga[gi + 1], b0 = gb[gj], b1 = gb[gj + 1];
+        if (A[a0].axis != B[b0].axis) break;
+        int cancelled = 0;
+        for (int h = b0; h < b1; h++)
+          for (int t = a0; t < a1; t++)
+            if (A[t].pos == B[h].pos) {
+              if (((A[t].amt + B[h].amt) & 3) == 0) { s += 2; cancelled++; }
+              else s += 1;
+              break;
+            }
+        if (cancelled != a1 - a0 || cancelled != b1 - b0) break;
+      }
+      return s;
+    };
+    auto bkey = [&](int axis, int pos, int amt) { return ((size_t)axis * (N + 2) + pos) * 4 + amt; };
+    std::vector<std::vector<int>> headB(3 * (size_t)(N + 2) * 4), tailB(3 * (size_t)(N + 2) * 4);
+    for (int i = 0; i < n; i++) {
+      const auto &m = insts[i].moves;
+      if (m.empty()) continue;
+      for (int k = goff[i][0]; k < goff[i][1]; k++) headB[bkey(m[k].axis, m[k].pos, m[k].amt)].push_back(i);
+      const int g = goff[i].size() - 2;
+      for (int k = goff[i][g]; k < goff[i][g + 1]; k++) tailB[bkey(m[k].axis, m[k].pos, m[k].amt)].push_back(i);
+    }
+    std::vector<int> nx(n, -1), pv(n, -1);
+    std::vector<long double> lab(n);
+    for (int k = 0; k < n; k++) {
+      lab[start[k]] = k;
+      if (k) { pv[start[k]] = start[k - 1]; nx[start[k - 1]] = start[k]; }
+    }
+    int first = start[0];
+    for (int pass = 0; pass < impPass; pass++) {
+      if (stop && stop->load(std::memory_order_relaxed)) break;
+      long accepted = 0;
+      for (int x0 = 0; x0 < n; x0++) {
+        int xe = x0;
+        for (int len = 1; len <= impRun; len++) {
+          if (len > 1) { xe = nx[xe]; if (xe < 0) break; }
+          const int P = pv[x0], Nn = nx[xe];
+          const long double r0 = lab[x0], r1 = lab[xe];
+          auto inRun = [&](int y) { return y >= 0 && lab[y] >= r0 && lab[y] <= r1; };
+          long double lo = -1e30L, hi = 1e30L;
+          bool hasPred = false, hasSucc = false;
+          for (int y = x0;; y = nx[y]) {
+            for (int p : pr[y]) if (!inRun(p)) { lo = std::max(lo, lab[p]); hasPred = true; }
+            for (int t : su[y]) if (!inRun(t)) { hi = std::min(hi, lab[t]); hasSucc = true; }
+            if (y == xe) break;
+          }
+          const int removeGain = save(P, Nn) - save(P, x0) - save(xe, Nn);
+          int bestGain = 0, bu = -2, bv = -2, evaluated = 0;
+          auto consider = [&](int u, int v) {
+            if (inRun(u) || inRun(v) || (u == P && v == Nn)) return;
+            if (u >= 0 ? lab[u] < lo : hasPred) return;
+            if (v >= 0 ? lab[v] > hi : hasSucc) return;
+            const int g = removeGain + save(u, x0) + save(xe, v) - save(u, v);
+            if (g > bestGain) { bestGain = g; bu = u; bv = v; }
+          };
+          {
+            const auto &m = insts[x0].moves;
+            for (int k = goff[x0][0]; k < goff[x0][1]; k++)
+              for (int amt = 1; amt <= 3; amt++)
+                for (int u : tailB[bkey(m[k].axis, m[k].pos, amt)]) {
+                  if (++evaluated > impCand) break;
+                  consider(u, nx[u] == x0 ? Nn : nx[u]);
+                }
+            evaluated = 0;
+            const auto &me = insts[xe].moves;
+            const int g = goff[xe].size() - 2;
+            for (int k = goff[xe][g]; k < goff[xe][g + 1]; k++)
+              for (int amt = 1; amt <= 3; amt++)
+                for (int v : headB[bkey(me[k].axis, me[k].pos, amt)]) {
+                  if (++evaluated > impCand) break;
+                  consider(pv[v] == xe ? P : pv[v], v);
+                }
+          }
+          if (bestGain <= 0) continue;
+          if (P >= 0) nx[P] = Nn; else first = Nn;
+          if (Nn >= 0) pv[Nn] = P;
+          if (bu >= 0) nx[bu] = x0; else first = x0;
+          pv[x0] = bu;
+          nx[xe] = bv;
+          if (bv >= 0) pv[bv] = xe;
+          const long double Lb = bu >= 0 ? lab[bu] : (bv >= 0 ? lab[bv] - (len + 1) : 0), Rb = bv >= 0 ? lab[bv] : Lb + len + 1;
+          if (Rb - Lb < 1e-6L) {  // relabel everything
+            long double v = 0;
+            for (int y = first; y >= 0; y = nx[y]) lab[y] = v++;
+          } else {
+            const long double step = (Rb - Lb) / (len + 1);
+            long double v = Lb + step;
+            for (int y = x0;; y = nx[y]) { lab[y] = v; v += step; if (y == xe) break; }
+          }
+          accepted++;
+          break;
+        }
+      }
+      if (!accepted) break;
+    }
+    std::vector<int> out;
+    for (int x = first; x >= 0; x = nx[x]) out.push_back(x);
+    return out;
+  }
+  // The merge: pairwise (levels above pairMaxInst instances), improved; then
+  // seeded pairwise restarts, each improved, while the time `budget` allows
+  // and at most `restarts` of them; the cheapest order wins.
+  int restarts = 256;
+  int pairMaxInst = 20000;
+  long statRestarts = 0;
+  std::vector<mv> mergeBest(long &rawMoves, long &mergedMoves, std::vector<int> *order = nullptr) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    rawMoves = 0;
+    for (auto &in : insts) rawMoves += in.moves.size();
+    const int n = insts.size();
+    std::vector<int> best;
+    if (n <= pairMaxInst) {
+      long r, m;
+      pairSeed = 0;
+      mergePairwise(r, m, &best);
+    } else
+      best = levelsOrder();
+    best = improveOrder(best);
+    long bestCost = orderCost(best);
+    statRestarts = 0;
+    if (n <= pairMaxInst) {
+      const double one = elapsed();  // a restart costs about as much as the first run
+      for (int k = 1; k <= restarts; k++) {
+        if (stop && stop->load(std::memory_order_relaxed)) break;
+        if (budget > 0 && elapsed() + one > budget) break;
+        Merger m = *this;
+        m.pairSeed = k;
+        m.budget = 0;
+        long r, x;
+        std::vector<int> o;
+        m.mergePairwise(r, x, &o);
+        o = improveOrder(o);
+        const long c = orderCost(o);
+        statRestarts++;
+        if (c < bestCost) { bestCost = c; best = std::move(o); }
+      }
+    }
+    pairSeed = 0;
+    tail.clear();
+    cost = 0;
+    for (int i : best)
+      for (auto &p : insts[i].moves) push(tail, cost, p);
+    mergedMoves = cost;
+    if (order) *order = best;
+    std::vector<mv> out;
+    for (auto &g : tail)
+      for (auto &l : g.layers) out.push_back(toMove({g.axis, l.first, l.second}));
+    return out;
+  }
+
   std::vector<MergeInst> insts;
   int N;
   const std::atomic<bool> *stop = nullptr;  // checked every 4096 merge steps
 
- private:
+ public:  // (Group and push are public for devtools experiments)
   struct Group {
     int8_t axis;
     std::vector<std::pair<int16_t, int8_t>> layers;  // (pos, amount), amount != 0
   };
-  std::vector<Group> tail;
-  long cost = 0;
-
   static void push(std::vector<Group> &t, long &c, const PLayer &p) {
     if (!t.empty() && t.back().axis == p.axis) {
       auto &L = t.back().layers;
@@ -570,6 +812,9 @@ class Merger {
       c++;
     }
   }
+ private:
+  std::vector<Group> tail;
+  long cost = 0;
   // cost increase of appending mv (only the tail can interact)
   int delta(const std::vector<PLayer> &mvs) const {
     size_t keep = std::min(tail.size(), mvs.size() + 1);

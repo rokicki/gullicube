@@ -58,7 +58,9 @@ static double now() {
 // Merge with the beam or greedily: the beam's cost grows about as
 // instances^2 x width while its gain shrinks for large merges (measured: -3%
 // at 10^3 and 16^3 with width 256; -1% at 64^3 at 30x the time).
-static bool gPairMerge = false;  // --pairmerge
+static bool gPairMerge = false;  // --pairmerge: plain pairwise merge
+static bool gOldMerge = false;   // --oldmerge: merge beam / greedy merge (the previous default)
+static int gMergeRestarts = 256; // --mergerestarts
 static std::vector<mv> mergeWith(Merger &mg, int beamOpt, long &raw, long &merged, std::vector<int> *order = nullptr,
                                  double budget = 0, const char *what = "") {
   size_t n = mg.insts.size();
@@ -83,6 +85,15 @@ static std::vector<mv> mergeWith(Merger &mg, int beamOpt, long &raw, long &merge
     double t0 = now();
     auto r = mg.mergePairwise(raw, merged, order);
     if (getenv("MERGETIME")) fprintf(stderr, "  merge %s: %zu instances, pairwise: %.3fs\n", what, n, now() - t0);
+    return r;
+  }
+  if (!gOldMerge && beamOpt < 0) {  // pairwise (or levels) + improvement + restarts within the budget
+    mg.budget = budget;
+    mg.restarts = gMergeRestarts;
+    double t0 = now();
+    auto r = mg.mergeBest(raw, merged, order);
+    if (getenv("MERGETIME"))
+      fprintf(stderr, "  merge %s: %zu instances, best of %ld restarts: %.3fs\n", what, n, mg.statRestarts + 1, now() - t0);
     return r;
   }
   int w = beamOpt >= 0 ? beamOpt : n <= 400 ? 256 : n <= 1500 ? 64 : 0;
@@ -922,9 +933,12 @@ static void usage() {
       "    -E              older pair endgame search (superseded by the finish tables; several GB)\n"
       "    --onemerge/--twomerge  one merge for pairs + diagonals + mids (default), or pairs first\n"
       "    --mergeshare f  greedy merge time budget = f x the pair beam time (default 0.5; 0 = unlimited)\n"
-      "    --mergebeam w   merge with a beam of width w instead of the greedy merge (0: greedy;\n"
-      "                    default: 256 up to 400 algorithm instances, 64 up to 1500, else greedy)\n"
-      "    --pairmerge     pairwise (greedy-edge) merge instead of the merge beam / greedy merge\n"
+      "    --mergebeam w   merge with a beam of width w (0: the greedy merge); with --oldmerge the\n"
+      "                    default is 256 up to 400 algorithm instances, 64 up to 1500, else greedy\n"
+      "    --mergerestarts k  merge: at most k seeded restarts of the pairwise merge within the\n"
+      "                    merge time budget (default 256)\n"
+      "    --oldmerge      merge with the merge beam / greedy merge (the previous default)\n"
+      "    --pairmerge     merge with the plain pairwise merge (no improvement, no restarts)\n"
       "    --seam/--noseam pair/diagonal/mid beams: cost minus moves cancelling with the previous\n"
       "                    algorithm (default on)\n"
       "    --finish        pair finish table: every beam child one algorithm from solved is seen\n"
@@ -1019,7 +1033,9 @@ int main(int argc, char **argv) {
     else if (a == "--seam") o.seam = true;                   // pair/diag/mid beams: seam-aware costs
     else if (a == "--onemerge") o.oneMerge = true;           // pairs + diagonals + mids merged together
     else if (a == "--twomerge") o.oneMerge = false;          // pairs merged, then diagonals + mids
-    else if (a == "--pairmerge") o.pairMerge = gPairMerge = true;  // pairwise merge (experimental)
+    else if (a == "--pairmerge") o.pairMerge = gPairMerge = true;  // plain pairwise merge (comparison)
+    else if (a == "--oldmerge") gOldMerge = true;                   // previous default merge (comparison)
+    else if (a == "--mergerestarts") gMergeRestarts = atoi(argv[++i]);
     else if (a == "--mergebeam") o.mergeBeam = atoi(argv[++i]);  // merge beam width (0: greedy; default by size)
     else if (a == "--mergeshare") o.mergeShare = atof(argv[++i]);  // merge time budget / pair beam time
     else if (a == "--noseam") o.seam = false;
