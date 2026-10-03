@@ -236,6 +236,7 @@ struct WingTableBeam {
       cx.best4 = best4;
       cx.bestNode = -1;
       for (size_t li = from; li < to; li++) {
+        if ((li & 63) == 0 && stop && stop->load(std::memory_order_relaxed)) return;  // Ctrl-C: within a level too
         const int ni = level[li];
         const Node &nd = nodes[ni];
         uint32_t V[5] = {0, 0, 0, 0, 0};
@@ -321,6 +322,7 @@ struct WingTableBeam {
         runNodes(ctx[0], 0, level.size() / U);
         for (auto &t : th) t.join();
       }
+      if (stop && stop->load(std::memory_order_relaxed)) return {};
       for (int u = 0; u < U; u++)
         if (ctx[u].bestNode >= 0 && ctx[u].best4 < best4) {
           best4 = ctx[u].best4; bestNode = ctx[u].bestNode; bestFin = ctx[u].bestFin; bestFinAlg = ctx[u].bestFinAlg;

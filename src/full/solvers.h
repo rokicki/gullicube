@@ -801,7 +801,9 @@ struct TableBeam {
       for (auto &sl : table) sl.score = INT32_MIN;
       minTree.reset(curTS);
       int filled = 0, weakest = INT32_MIN;  // weakest score in the table once every slot is filled
+      size_t nodeCount = 0;
       for (int ni : level) {
+        if ((++nodeCount & 63) == 0 && stop && stop->load(std::memory_order_relaxed)) return {};  // Ctrl-C within a level
         const Node &nd = nodes[ni];
         int m = 48 - nd.s.correct();
         if (m == 0) {
