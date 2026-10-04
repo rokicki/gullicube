@@ -30,6 +30,16 @@
 // read-only during solves; solveOnce() works on a copy of the scrambled cube
 // and keeps all of its state local, so solves can be repeated.
 #if defined(__APPLE__) || defined(__linux__)
+// Per-phase instruction / cycle counters (phaseMark): compiled in with
+// -DGULLI_PHASESTAT=1 (make clean; make DEFS=-DGULLI_PHASESTAT=1), then on with PHASESTAT=1.
+#ifndef GULLI_PHASESTAT
+#define GULLI_PHASESTAT 0
+#endif
+#if GULLI_PHASESTAT && defined(__APPLE__)
+#include <libproc.h>
+#include <mach/mach_time.h>
+#include <unistd.h>
+#endif
 #include <sys/resource.h>
 #endif
 #include <deque>
@@ -67,6 +77,39 @@ static double peakRssMB() {
   return 0;
 #endif
 }
+static double now();
+// PHASESTAT=1 (in a -DGULLI_PHASESTAT=1 build): instructions, cycles, IPC and
+// busy threads per phase (macOS: the process's counters from proc_pid_rusage;
+// elsewhere times only)
+#if !GULLI_PHASESTAT
+static inline void phaseMark(const char *) {}
+#else
+static void phaseMark(const char *name) {
+  static bool on = getenv("PHASESTAT") != nullptr;
+  static double lastT = 0;
+  static uint64_t lastI = 0, lastC = 0, lastU = 0;
+  if (!on) return;
+  uint64_t ins = 0, cyc = 0, cpu = 0;
+#if defined(__APPLE__)
+  rusage_info_v4 ri;
+  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ri) == 0) {
+    ins = ri.ri_instructions;
+    cyc = ri.ri_cycles;
+    cpu = ri.ri_user_time + ri.ri_system_time;  // mach time units (ns on Apple silicon via timebase below)
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    cpu = cpu * tb.numer / tb.denom;
+  }
+#endif
+  const double t = now();
+  if (name) {
+    const double wall = t - lastT, dI = (double)(ins - lastI), dC = (double)(cyc - lastC), dU = (double)(cpu - lastU) * 1e-9;
+    fprintf(stderr, "  phase %-18s %8.3fs  %8.2fG instr  %8.2fG cycles  IPC %5.2f  threads %5.1f\n", name, wall, dI * 1e-9,
+            dC * 1e-9, dC > 0 ? dI / dC : 0.0, wall > 0 ? dU / wall : 0.0);
+  }
+  lastT = t; lastI = ins; lastC = cyc; lastU = cpu;
+}
+#endif
 static double now() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -470,6 +513,7 @@ static EdgesOut runEdges(const Res &R, const Opts &o, const xcube &initial, int 
     E.corners += rec.size();
   }
   E.tCorners = now() - ts;
+  phaseMark("corners");
 
   // ---------------------------------------------------------------- 1. wings (centres free)
   ts = now();
@@ -495,6 +539,7 @@ static EdgesOut runEdges(const Res &R, const Opts &o, const xcube &initial, int 
     for (int j = 0; j < 24; j++)
       if (cube.wingorbits[k].a[j] != j) { fprintf(stderr, "wing orbit %d not solved\n", k); return E; }
   E.tWings = now() - ts;
+  phaseMark("wings");
   E.ok = true;
   return E;
 }
@@ -728,6 +773,7 @@ static Result finishCentres(const Res &R, const Opts &o, const EdgesOut &E, cons
     }
   }
   res.tPairs = now() - ts;
+  phaseMark("pair merge");
   if (stopped()) { res.aborted = true; return res; }
 
   // ---------------------------------------------------------------- 3. diagonals, mids
@@ -790,6 +836,7 @@ static Result finishCentres(const Res &R, const Opts &o, const EdgesOut &E, cons
   res.sRetries = sRetries;
   res.sFallback = sFallback;
   res.tDiagSolve = now() - ts;
+  phaseMark("diag/mid beams");
   if (stopped()) { res.aborted = true; return res; }
   {
     Merger mg(N);
@@ -877,6 +924,7 @@ static Result finishCentres(const Res &R, const Opts &o, const EdgesOut &E, cons
     }
   }
   res.tDiag = now() - ts;
+  phaseMark("centre merge");
 
   // ---------------------------------------------------------------- final check
   bool solved = true;
@@ -910,6 +958,7 @@ static Result solveOnce(const Res &R, const Opts &o, const xcube &initial, int w
   long retries = 0, fallback = 0;
   if (!solvePairs(R, o, E.cube, width, stop, pj, retries, fallback)) { Result r; r.aborted = stop && stop->load(); return r; }
   double tPairSolve = now() - ts;
+  phaseMark("pair beams");
   Result r = finishCentres(R, o, E, pj, width, stop, keepMoves, tPairSolve);
   r.retries = retries;
   r.retryFailed = fallback;
@@ -1085,6 +1134,7 @@ static void usage() {
 
 int main(int argc, char **argv) {
   const double tProgram = now();
+  phaseMark(nullptr);
   if (argc < 2) { usage(); return 1; }
   printf("#");
   for (int i = 0; i < argc; i++) printf(" %s", argv[i]);
@@ -1180,6 +1230,7 @@ int main(int argc, char **argv) {
   double t0 = now();
   auto R = std::make_unique<Res>();
   if (!R->load(o)) return 1;
+  phaseMark("load");
   double tLoad = now() - t0;
 
   // the scrambled cube; every solve works on a copy

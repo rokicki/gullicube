@@ -512,6 +512,18 @@ struct FinishTable {
       if (slots[i].key == 0) return nullptr;
     }
   }
+  // fetch the slots find(ks) will read (this table and next)
+  void prefetch(const uint64_t *ks) const {
+    if (slots) {
+      uint64_t k = ks[0];
+      if (sym && sym->n > 1) {
+        for (int j = 1; j < sym->n; j++) k = std::min(k, ks[j]);
+        k = mixKey(k);
+      }
+      __builtin_prefetch(&slots[home(k)]);
+    }
+    if (next) next->prefetch(ks);
+  }
   // cheapest finishing algorithm for the state with keys ks (ks[g] = key under rotation g of
   // the reducing group; ks[0] the plain key), this table and next; false if none
   bool find(const uint64_t *ks, Hit &out) const {
@@ -937,6 +949,13 @@ struct TableBeam {
     constexpr uint32_t NOLIST = UINT32_MAX;
     std::vector<uint32_t> survDat, survDatPrev, survBeg, survBegPrev, survEnd, survEndPrev;
     std::vector<uint8_t> rejOk, rejOkPrev;  // the node's incremental reject set was built
+    std::vector<uint32_t> cands;            // a node's survivors (bitset path)
+    // finish lookups of admitted children, resolved at the level's end (their slots
+    // prefetched); only when the lookup does not decide admission
+    struct PendFin { uint64_t ks[4]; int g4, ni; uint32_t a; };
+    std::vector<PendFin> pendFin;
+    const bool deferFinish = finish && !finishSkip && !finishLBMis && !getenv("NODEFER");
+    const uint32_t PF = getenv("PFDIST") ? atoi(getenv("PFDIST")) : 32;  // prefetch distance (survivor lists)
 
     long nAdmit = 0, nLevels = 0;
     for (int depth = 0; depth < 60 && !level.empty(); depth++) {
@@ -1035,6 +1054,11 @@ struct TableBeam {
                 for (auto d : supp[a]) k ^= Zg[d][nd.s.col[d]] ^ Zg[d][nd.s.col[src[d]]];
                 ks[g] = k;
               }
+            if (deferFinish) {  // looked up at the level's end, its slots fetched meanwhile
+              finish->prefetch(ks);
+              pendFin.push_back({{ks[0], ks[1], ks[2], ks[3]}, g4, ni, (uint32_t)a});
+              if (timing) { nsAdmitFin += nsNow() - tF; nAdmitFin++; }
+            } else {
             FinishTable::Hit hit;
             const bool found = finish->find(ks, hit);
             if (timing) { nsAdmitFin += nsNow() - tF; nAdmitFin++; }
@@ -1050,6 +1074,7 @@ struct TableBeam {
                 sc = std::min(sc, tab[48] - g4 - 2 * minE4);
                 if (sc < weakest) return;
               }
+            }
             }
           }
           if (!faceExtra.empty()) {
@@ -1158,8 +1183,13 @@ struct TableBeam {
           } else if (fromList) {
             const uint64_t *Xa = X.data();
             const size_t b0 = survDat.size();
+            const uint32_t *sd = survDatPrev.data();
             for (uint32_t j = survBegPrev[pi], je = survEndPrev[pi]; j < je; j++) {
-              const uint32_t a = survDatPrev[j];
+              if (j + PF < je) {  // the records are scattered: fetch ahead
+                __builtin_prefetch(&Xa[sd[j + PF]]);
+                __builtin_prefetch(&rec[sd[j + PF]]);
+              }
+              const uint32_t a = sd[j];
               if (Xa[a] & corr) continue;
               survDat.push_back(a);
               scoreOne(a);
@@ -1167,17 +1197,19 @@ struct TableBeam {
             survBeg[li] = b0; survEnd[li] = survDat.size();
           } else {
             const size_t b0 = survDat.size();
-            bool keep = listMax > 0;
+            // collect the survivors (fetching their records ahead), then score them
+            cands.clear();
             for (size_t w = 0; w < nw; w++)
               for (uint64_t bits = ~rej[w]; bits; bits &= bits - 1) {
-                const size_t a = w * 64 + __builtin_ctzll(bits);
-                if (keep) {
-                  if (survDat.size() - b0 < listMax) survDat.push_back(a);
-                  else { keep = false; survDat.resize(b0); }
-                }
-                scoreOne(a);
+                const uint32_t a = w * 64 + __builtin_ctzll(bits);
+                __builtin_prefetch(&rec[a]);
+                cands.push_back(a);
               }
-            if (keep) { survBeg[li] = b0; survEnd[li] = survDat.size(); }
+            if (listMax > 0 && cands.size() <= listMax) {
+              survDat.insert(survDat.end(), cands.begin(), cands.end());
+              survBeg[li] = b0; survEnd[li] = survDat.size();
+            }
+            for (uint32_t a : cands) scoreOne(a);
           }
           if (timing) {
             long tC = nsNow();
@@ -1211,6 +1243,15 @@ struct TableBeam {
         }
       }
         }
+      // the level's deferred finish lookups
+      for (const auto &p : pendFin) {
+        FinishTable::Hit hit;
+        if (finish->find(p.ks, hit) && p.g4 + hit.e4 < best4) {
+          best4 = p.g4 + hit.e4;
+          bestNode = p.ni; bestAlg = p.a; bestFin = true; bestHit = hit; bestSol = EG2::Sol();
+        }
+      }
+      pendFin.clear();
       const long tExp = timing ? nsNow() : 0;
       level.clear();
       for (auto &sl : table) {

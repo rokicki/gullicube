@@ -2,7 +2,10 @@
 # *.cls data files from data/ beside the executable (as named on the command line).
 CXX      ?= c++
 CXXFLAGS ?= -O3 -std=c++20
-CPPFLAGS += -Isrc/brob -Isrc/full
+# DEFS: extra defines, e.g. `make clean; make DEFS=-DGULLI_PHASESTAT=1` for the
+# per-phase instruction / cycle counters (run with PHASESTAT=1)
+DEFS     ?=
+CPPFLAGS += -Isrc/brob -Isrc/full $(DEFS)
 LDLIBS   += -lpthread
 
 BROB = src/brob/xcube.o src/brob/cornersolver.o src/brob/wingsolver.o src/brob/util.o src/brob/facelets.o
