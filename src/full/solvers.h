@@ -708,6 +708,7 @@ struct TableBeam {
   // incremental reject sets only while a level's sets fit in this many bytes
   // (per beam, two levels kept; many beams run at once)
   // (64 MB cost up to 1.8 GB at 16 threads for no measurable speed; 4 MB keeps them for narrow beams)
+  size_t listBytes = getenv("LISTMB") ? (size_t)atof(getenv("LISTMB")) << 20 : (size_t)8 << 20;  // survivor lists per level (64 MB: up to 0.5 GB more at wide beams, no speed)
   size_t incrBytes = getenv("INCRMB") ? (size_t)atof(getenv("INCRMB")) << 20 : (size_t)4 << 20;
   bool noIncr = getenv("NOINCR") != nullptr, noAoS = getenv("NOAOS") != nullptr, noList = getenv("NOLIST") != nullptr;
   // Transposed: bitset over algorithms, per position p, of the algorithms that
@@ -950,7 +951,7 @@ struct TableBeam {
       survEnd.assign(level.size(), 0);
       rejOk.assign(level.size(), 0);
       // lists pay off below about two bitset walks, and are capped at 64MB per level
-      const size_t listMax = noList ? 0 : std::min<size_t>(2 * nw, (16u << 20) / level.size());
+      const size_t listMax = noList ? 0 : std::min<size_t>(2 * nw, listBytes / 4 / level.size());
       prevBase = levelBase;
       levelBase = level[0];
       // the incremental sets cost width * pool/8 bytes per level: above 64MB,
