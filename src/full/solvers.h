@@ -705,6 +705,10 @@ struct TableBeam {
   int widthCap = 1 << 16;  // ... up to this
   const std::atomic<bool> *stop = nullptr;  // checked once per level  // reject any algorithm that moves a solved piece at all
   bool timing = false;
+  // incremental reject sets only while a level's sets fit in this many bytes
+  // (per beam, two levels kept; many beams run at once)
+  // (64 MB cost up to 1.8 GB at 16 threads for no measurable speed; 4 MB keeps them for narrow beams)
+  size_t incrBytes = getenv("INCRMB") ? (size_t)atof(getenv("INCRMB")) << 20 : (size_t)4 << 20;
   bool noIncr = getenv("NOINCR") != nullptr, noAoS = getenv("NOAOS") != nullptr, noList = getenv("NOLIST") != nullptr;
   // Transposed: bitset over algorithms, per position p, of the algorithms that
   // carry p's piece off its face.  Rejected = OR over correct positions.
@@ -951,7 +955,7 @@ struct TableBeam {
       levelBase = level[0];
       // the incremental sets cost width * pool/8 bytes per level: above 64MB,
       // rebuild each node's set from scratch instead
-      const bool incr = !noIncr && keepSolved && !useIndex && level.size() * nw * 8 <= (64u << 20);
+      const bool incr = !noIncr && keepSolved && !useIndex && level.size() * nw * 8 <= incrBytes;
       const bool parentIncr = incr && !rejPrev.empty();
       rejArena.resize(incr ? level.size() * nw : 0);
       rejCorr.resize(level.size());  // also used by the survivor lists
