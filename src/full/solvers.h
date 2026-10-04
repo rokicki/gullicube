@@ -13,6 +13,9 @@
 // effcost charges face-turn setup moves (the X of X c X') at a discount, since
 // those mostly cancel when many orbit solutions are merged.
 #pragma once
+#include <mutex>
+#include <memory>
+#include <cmath>
 #include "mintree.h"
 #include "../pair/pool.h"
 #include "../pair/eg2.h"
@@ -337,22 +340,87 @@ struct CycleFinisher {
 #ifndef FINISH_RING
 #define FINISH_RING 32
 #endif
+// Symmetry reduction of a class-built finish table: the table keeps one state
+// per orbit under a small group G of cube rotations (the four about the U-D
+// axis), keyed by the least key over the orbit, so it is |G| times smaller.  A
+// probe takes the state's keys under every rotation (the beam keeps them
+// incrementally), looks up the least, and turns the stored algorithm (which
+// solves the rotated state) back by composing its image with the inverse
+// rotation.
+struct FinishSym {
+  int n = 1;                 // |G| (1: no reduction)
+  int sym[4] = {0, 0, 0, 0};  // G as symmetry indices of the orbit model (sym[0] = identity)
+  uint64_t Zr[4][48][6];      // key tables of the rotated state: key(g X) = XOR_p Zr[g][p][X[p]]
+  uint8_t back[4][48];        // image symmetry t of a hit found under rotation g -> g^-1 o t
+  // keys of state col under every rotation (out[0] = the plain key)
+  void keys(const uint8_t *col, uint64_t *out) const {
+    for (int g = 0; g < n; g++) {
+      uint64_t k = 0;
+      for (int p = 0; p < 48; p++) k ^= Zr[g][p][col[p]];
+      out[g] = k;
+    }
+  }
+  // build for the rotations about U-D from an orbit model (sigma per symmetry, faces)
+  template <class OM> void build(const OM &m, const uint64_t (&Z)[48][6], int want) {
+    n = 1;
+    sym[0] = -1;
+    for (size_t t = 0; t < m.syms.size(); t++) {
+      const auto &y = m.syms[t];
+      bool id = true;
+      for (int f = 0; f < 6; f++) id &= y.face[f] == f;
+      if (id && !y.refl) sym[0] = t;
+    }
+    for (size_t t = 0; t < m.syms.size() && n < want; t++) {
+      const auto &y = m.syms[t];
+      if ((int)t == sym[0] || y.refl || y.face[0] != 0 || y.face[5] != 5) continue;
+      sym[n++] = t;
+    }
+    auto sig = [&](int t, int p) { return p < m.P ? (int)m.sigma[t][p] : p; };
+    for (int g = 0; g < n; g++)
+      for (int p = 0; p < 48; p++)
+        // positions outside the model (always solved) are left as they are, as in the build
+        for (int c = 0; c < 6; c++) Zr[g][p][c] = p < m.P ? Z[sig(sym[g], p)][m.syms[sym[g]].face[c]] : Z[p][c];
+    // back[g][t]: the symmetry u with sigma_u = sigma_g^-1 o sigma_t
+    for (int g = 0; g < n; g++)
+      for (size_t t = 0; t < m.syms.size(); t++) {
+        int found = -1;
+        for (size_t u = 0; u < m.syms.size() && found < 0; u++) {
+          bool eq = true;
+          for (int p = 0; p < m.P && eq; p++) eq = m.sigma[sym[g]][m.sigma[u][p]] == m.sigma[t][p];
+          if (eq) found = u;
+        }
+        back[g][t] = (uint8_t)found;
+      }
+  }
+};
+
 struct FinishTable {
   struct Slot { uint64_t key; uint32_t alg; int16_t e4; uint8_t pid, cost; };  // one probe, one line
   static_assert(sizeof(Slot) == 16);
   std::vector<Slot> own;        // the table (built, or read from a saved file)
   const Slot *slots = nullptr;  // own.data()
-  uint64_t mask = 0;
+  uint64_t nslots = 0;          // any size below 2^32: the home slot is a multiply-shift of the key's high half
   size_t used = 0;
+  size_t home(uint64_t k) const { return (size_t)(((k >> 32) * nslots) >> 32); }
+  size_t step(size_t i) const { return i + 1 == nslots ? 0 : i + 1; }
   const FinishTable *next = nullptr;  // a second table probed as well (cheapest hit wins)
+  const FinishSym *sym = nullptr;     // set: this table holds one state per rotation orbit (class-built tables)
+  struct Hit { int e4 = 0; uint8_t pid = 0, cost = 0; uint32_t alg = 0; };
+  // the least of several keys is biased small; reduced tables store it mixed
+  // (a bijection), so the slot index and the size estimate see uniform bits
+  static uint64_t mixKey(uint64_t x) {
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL; x ^= x >> 27; x *= 0x94D049BB133111EBULL; x ^= x >> 31;
+    return x;
+  }
   FinishTable() = default;
   FinishTable(const FinishTable &) = delete;
-  void init(size_t capacity) {
-    size_t sz = 1;  // capacity counts duplicates (many algorithms finish the same state)
-    while (sz < capacity + capacity / 4) sz <<= 1;
+  void init(size_t capacity) {  // capacity: the most states it will hold
+    initSlots(capacity + capacity / 4 + 16);
+  }
+  void initSlots(size_t sz) {
     own.assign(sz, Slot{0, 0, 0, 0, 0});
     slots = own.data();
-    mask = sz - 1;
+    nslots = sz;
     used = 0;
   }
   // add every algorithm of p (effective costs eff4) under pool id `id`
@@ -385,7 +453,7 @@ struct FinishTable {
     }
     ~Batch() { flush(); }
     void add(uint64_t k, int e, int c, uint8_t id, uint32_t b) {
-      __builtin_prefetch(&t.own[k & t.mask], 1);
+      __builtin_prefetch(&t.own[t.home(k)], 1);
       if (n == RING) {  // the oldest pending insert's line has had RING inserts' time to arrive
         put(ring[head]);
         head = (head + 1) % RING;
@@ -407,7 +475,9 @@ struct FinishTable {
     Slot nv{k, b, (int16_t)e, id, (uint8_t)c};
     uint64_t nval;
     memcpy(&nval, (const char *)&nv + 8, 8);
-    for (size_t i = k & mask;; i = (i + 1) & mask) {
+    size_t probes = 0;
+    for (size_t i = home(k);; i = step(i)) {
+      if (++probes > nslots) { fprintf(stderr, "finish table full (%llu slots)\n", (unsigned long long)nslots); exit(1); }
       std::atomic_ref<uint64_t> key(own[i].key);
       uint64_t cur = key.load(std::memory_order_acquire);
       if (cur == 0) {
@@ -420,31 +490,49 @@ struct FinishTable {
       for (;;) {
         Slot os;
         memcpy((char *)&os + 8, &old, 8);
-        if (old != 0 && os.e4 <= e) return claimed;
+        // keep the cheapest, ties to the lower (pool, algorithm): the result does not depend on thread timing
+        if (old != 0 && (os.e4 < e || (os.e4 == e && (os.pid < id || (os.pid == id && os.alg <= b))))) return claimed;
         if (val.compare_exchange_weak(old, nval)) return claimed;
       }
     }
   }
   void insertKey(uint64_t k, int e, int c, uint8_t id, uint32_t b) {
-    for (size_t i = k & mask;; i = (i + 1) & mask) {
+    for (size_t i = home(k);; i = step(i)) {
       Slot &s = own[i];
       if (s.key == k) {
-        if (e < s.e4) s = {k, b, (int16_t)e, id, (uint8_t)c};
+        if (e < s.e4 || (e == s.e4 && (id < s.pid || (id == s.pid && b < s.alg)))) s = {k, b, (int16_t)e, id, (uint8_t)c};
         return;
       }
       if (s.key == 0) { s = {k, b, (int16_t)e, id, (uint8_t)c}; used++; return; }
     }
   }
   const Slot *find1(uint64_t k) const {
-    for (size_t i = k & mask;; i = (i + 1) & mask) {
+    for (size_t i = home(k);; i = step(i)) {
       if (slots[i].key == k) return &slots[i];
       if (slots[i].key == 0) return nullptr;
     }
   }
-  // cheapest finishing algorithm for the state with hash k (this table and next), or nullptr
-  const Slot *find(uint64_t k) const {
-    const Slot *a = slots ? find1(k) : nullptr, *b = next ? next->find(k) : nullptr;
-    return !a ? b : !b ? a : (b->e4 < a->e4 ? b : a);
+  // cheapest finishing algorithm for the state with keys ks (ks[g] = key under rotation g of
+  // the reducing group; ks[0] the plain key), this table and next; false if none
+  bool find(const uint64_t *ks, Hit &out) const {
+    bool have = false;
+    if (slots) {
+      const Slot *a = nullptr;
+      int g = 0;
+      if (sym && sym->n > 1) {  // the least key over the orbit
+        uint64_t k = ks[0];
+        for (int j = 1; j < sym->n; j++) if (ks[j] < k) { k = ks[j]; g = j; }
+        a = find1(mixKey(k));
+      } else a = find1(ks[0]);
+      if (a) {
+        out = {a->e4, a->pid, a->cost, a->alg};
+        if (g) out.alg = out.alg / 96 * 96 + sym->back[g][(out.alg % 96) >> 1] * 2 + (out.alg & 1);
+        have = true;
+      }
+    }
+    Hit b;
+    if (next && next->find(ks, b) && (!have || b.e4 < out.e4)) { out = b; have = true; }
+    return have;
   }
 
 };
@@ -468,9 +556,6 @@ inline void buildFinishFromClassList(FinishTable &own, FinishTable &ext, const P
   own.init(pool.size());
   own.add(pool, Z, eff4, 0);
   own.next = &ext;
-  size_t cap = 0;
-  for (auto &e : list) cap += e.first->size() * 96;  // every image, duplicates included
-  ext.init(cap);
   {
     // Keys straight from the class representative: image = sigma o q o sigma^-1
     // (q = the representative's perm or its inverse), so its key
@@ -485,34 +570,98 @@ inline void buildFinishFromClassList(FinishTable &own, FinishTable &ext, const P
       for (int x = 0; x < P; x++)
         for (int j = 0; j < P; j++) KT[(sy * P + x) * P + j] = Z[model.sigma[sy][x]][target(model.sigma[sy][j])];
     const int threads = std::max(1u, std::thread::hardware_concurrency());
-    std::atomic<size_t> claimedAll{0};
-    for (auto &e : list) {
-    const CP &cp = *e.first;
-    const uint8_t pid = e.second;
-    std::atomic<size_t> next{0};
-    std::vector<std::thread> th;
-    for (int t = 0; t < threads; t++)
-      th.emplace_back([&] {
-        FinishTable::Batch batch(ext, true);
-        uint8_t q[2][48];
-        for (size_t lo; (lo = next.fetch_add(4096)) < cp.size();)
-          for (size_t r = lo; r < std::min(cp.size(), lo + 4096); r++) {
-            auto base = model.permOf(cp.rep[r]);
-            for (int j = 0; j < P; j++) { q[0][j] = base[j]; q[1][base[j]] = j; }
-            const int c = cp.cost[r];
-            for (int img = 0; img < 96; img++) {
-              const uint8_t *qq = q[img & 1];
-              const uint64_t *kt = &KT[(size_t)(img >> 1) * P * P];
-              uint64_t k = k0;
-              for (int j = 0; j < P; j++) k ^= kt[qq[j] * P + j];
-              batch.add(k, 4 * c, c, pid, (uint32_t)(r * 96 + img));
-            }
+    // With ext.sym: each image's key is replaced by the least key over its
+    // rotation orbit, and only the orbit's least member is inserted (its
+    // algorithm solves the stored state).  The rotated states are exactly the
+    // states solved by the rotated images: key(g S_t) = key(S_(g o t)).
+    const FinishSym *red = ext.sym && ext.sym->n > 1 ? ext.sym : nullptr;
+    std::vector<int> comp;  // comp[g * 48 + t]: the symmetry g o t
+    if (red) {
+      comp.assign(red->n * 48, -1);
+      for (int g = 0; g < red->n; g++)
+        for (size_t t = 0; t < model.syms.size(); t++)
+          for (size_t u = 0; u < model.syms.size(); u++) {
+            bool eq = true;
+            for (int p = 0; p < P && eq; p++) eq = model.sigma[u][p] == model.sigma[red->sym[g]][model.sigma[t][p]];
+            if (eq) { comp[g * 48 + t] = u; break; }
           }
-        batch.flush();
-        claimedAll += batch.claimed;
-      });
-    for (auto &t : th) t.join();
     }
+    if (red && std::count(comp.begin(), comp.end(), -1)) {
+      fprintf(stderr, "finish table: rotation composition incomplete (%ld missing)\n", (long)std::count(comp.begin(), comp.end(), -1));
+      exit(1);
+    }
+    // every image's key, on all threads: emit(threadState, key, cost, pid, alg)
+    auto forEachKey = [&](auto makeState, auto emit, auto finish) {
+      for (auto &e : list) {
+        const CP &cp = *e.first;
+        const uint8_t pid = e.second;
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < threads; t++)
+          th.emplace_back([&] {
+            auto st = makeState();
+            uint8_t q[2][48];
+            for (size_t lo; (lo = next.fetch_add(4096)) < cp.size();)
+              for (size_t r = lo; r < std::min(cp.size(), lo + 4096); r++) {
+                auto base = model.permOf(cp.rep[r]);
+                for (int j = 0; j < P; j++) { q[0][j] = base[j]; q[1][base[j]] = j; }
+                const int c = cp.cost[r];
+                uint64_t key[96];
+                for (int img = 0; img < 96; img++) {
+                  const uint8_t *qq = q[img & 1];
+                  const uint64_t *kt = &KT[(size_t)(img >> 1) * P * P];
+                  uint64_t k = k0;
+                  for (int j = 0; j < P; j++) k ^= kt[qq[j] * P + j];
+                  key[img] = k;
+                }
+                for (int img = 0; img < 96; img++) {
+                  if (red) {  // emit once per orbit: at its least member
+                    const int t = img >> 1;
+                    bool least = true;
+                    for (int g = 1; g < red->n && least; g++) {
+                      const int o = comp[g * 48 + t] * 2 + (img & 1);
+                      least = key[img] < key[o] || (key[img] == key[o] && img <= o);
+                    }
+                    if (!least) continue;
+                  }
+                  emit(*st, red ? FinishTable::mixKey(key[img]) : key[img], c, pid, (uint32_t)(r * 96 + img));
+                }
+              }
+            finish(*st);
+          });
+        for (auto &t : th) t.join();
+      }
+    };
+    // Pass 1: the number of distinct states (many images finish the same one),
+    // estimated with a HyperLogLog sketch (2^14 registers, about 1% error), so
+    // the table is sized for the states it will hold.  The keys are Zobrist
+    // XORs, so their bits are already uniform.
+    constexpr int HB = 14;
+    std::vector<uint8_t> reg(1 << HB, 0);
+    std::mutex regMu;
+    forEachKey([] { return std::make_unique<std::vector<uint8_t>>(1 << HB, 0); },
+               [](std::vector<uint8_t> &r, uint64_t k, int, uint8_t, uint32_t) {
+                 const uint64_t rest = k << HB;
+                 const uint8_t rho = rest ? (uint8_t)(__builtin_clzll(rest) + 1) : (uint8_t)(64 - HB + 1);
+                 uint8_t &x = r[k >> (64 - HB)];
+                 if (rho > x) x = rho;
+               },
+               [&](std::vector<uint8_t> &r) {
+                 std::lock_guard<std::mutex> g(regMu);
+                 for (size_t i = 0; i < reg.size(); i++) reg[i] = std::max(reg[i], r[i]);
+               });
+    double sum = 0;
+    size_t zeros = 0;
+    for (auto x : reg) { sum += std::ldexp(1.0, -x); zeros += x == 0; }
+    const double m = reg.size(), alpha = 0.7213 / (1 + 1.079 / m);
+    double est = alpha * m * m / sum;
+    if (est < 2.5 * m && zeros) est = m * std::log(m / zeros);  // small range: linear counting
+    // Pass 2: insert, the table about 74% full (estimate x 1.35, with 3% margin for the estimate)
+    ext.initSlots((size_t)(est * 1.03 * 1.35) + 64);
+    std::atomic<size_t> claimedAll{0};
+    forEachKey([&] { return std::make_unique<FinishTable::Batch>(ext, true); },
+               [](FinishTable::Batch &b, uint64_t k, int c, uint8_t pid, uint32_t alg) { b.add(k, 4 * c, c, pid, alg); },
+               [&](FinishTable::Batch &b) { b.flush(); claimedAll += b.claimed; });
     ext.used = claimedAll;
   }
 }
@@ -556,6 +705,11 @@ struct TableBeam {
   int widthCap = 1 << 16;  // ... up to this
   const std::atomic<bool> *stop = nullptr;  // checked once per level  // reject any algorithm that moves a solved piece at all
   bool timing = false;
+  // incremental reject sets only while a level's sets fit in this many bytes
+  // (per beam, two levels kept; many beams run at once)
+  // (64 MB cost up to 1.8 GB at 16 threads for no measurable speed; 4 MB keeps them for narrow beams)
+  size_t listBytes = getenv("LISTMB") ? (size_t)atof(getenv("LISTMB")) << 20 : (size_t)8 << 20;  // survivor lists per level (64 MB: up to 0.5 GB more at wide beams, no speed)
+  size_t incrBytes = getenv("INCRMB") ? (size_t)atof(getenv("INCRMB")) << 20 : (size_t)4 << 20;
   bool noIncr = getenv("NOINCR") != nullptr, noAoS = getenv("NOAOS") != nullptr, noList = getenv("NOLIST") != nullptr;
   // Transposed: bitset over algorithms, per position p, of the algorithms that
   // carry p's piece off its face.  Rejected = OR over correct positions.
@@ -633,7 +787,16 @@ struct TableBeam {
     for (int d = 0; d < 48; d++) h ^= Z[d][s.col[d]];
     return h;
   }
-  struct Node { State s; uint64_t h; int g4, parent; uint32_t alg; uint16_t tail = 0xFFFF; };
+  struct Node { State s; uint64_t h; int g4, parent; uint32_t alg; uint16_t tail = 0xFFFF; uint64_t hr[3] = {0, 0, 0}; };
+  // the finish table's reducing rotations (null or n == 1: none); the beam keeps
+  // each node's keys under them (hr) for the finish probes
+  const FinishSym *fsym = nullptr;
+  void setRot(Node &nd) const {
+    if (!fsym || fsym->n < 2) return;
+    uint64_t k[4];
+    fsym->keys(nd.s.col.data(), k);
+    for (int g = 1; g < fsym->n; g++) nd.hr[g - 1] = k[g];
+  }
   // Seam-aware costs: an algorithm's cost minus the moves that cancel against
   // the last same-axis group of the sequence so far (only that group can
   // interact with the algorithm's first group).  First groups come from a
@@ -714,6 +877,7 @@ struct TableBeam {
     };
     std::vector<Node> nodes;
     nodes.push_back({start, zob(start), 0, -1, 0, 0xFFFF});
+    setRot(nodes.back());
     std::vector<int> level = {0};
     int SEEN = 1 << 12;  // duplicate filter, sized to the beam
     while (SEEN < 64 * TS && SEEN < (1 << 20)) SEEN <<= 1;
@@ -729,6 +893,7 @@ struct TableBeam {
           const Node &pn = nodes[par];
           State ns = pn.s.apply(pool, sd[i]);
           nodes.push_back({ns, zob(ns), pn.g4 + cs->eff4[sd[i]], par, sd[i], 0xFFFF});
+          setRot(nodes.back());
           par = nodes.size() - 1;
         }
         lastInner.push_back(par);
@@ -740,6 +905,7 @@ struct TableBeam {
         const int par = lastInner[k];
         State ns = nodes[par].s.apply(pool, sd.back());
         nodes.push_back({ns, zob(ns), nodes[par].g4 + cs->eff4[sd.back()], par, sd.back(), 0xFFFF});
+        setRot(nodes.back());
         level.push_back(nodes.size() - 1);
         seen[nodes.back().h & (SEEN - 1)] = nodes.back().h;
       }
@@ -749,7 +915,8 @@ struct TableBeam {
     MinTree minTree;
     int best4 = 1 << 30, bestNode = -1;
     long bestAlg = -1;
-    const FinishTable::Slot *bestFin = nullptr;
+    FinishTable::Hit bestHit;
+    bool bestFin = false;  // the solution ends with bestHit's algorithm
     const int minE4 = finish ? *std::min_element(cs->eff4.begin(), cs->eff4.end()) : 0;  // finish-table solution: bestNode, then bestAlg, then the table's algorithm
     EG2::Sol bestSol;
     const size_t n = pool.size();
@@ -784,12 +951,12 @@ struct TableBeam {
       survEnd.assign(level.size(), 0);
       rejOk.assign(level.size(), 0);
       // lists pay off below about two bitset walks, and are capped at 64MB per level
-      const size_t listMax = noList ? 0 : std::min<size_t>(2 * nw, (16u << 20) / level.size());
+      const size_t listMax = noList ? 0 : std::min<size_t>(2 * nw, listBytes / 4 / level.size());
       prevBase = levelBase;
       levelBase = level[0];
       // the incremental sets cost width * pool/8 bytes per level: above 64MB,
       // rebuild each node's set from scratch instead
-      const bool incr = !noIncr && keepSolved && !useIndex && level.size() * nw * 8 <= (64u << 20);
+      const bool incr = !noIncr && keepSolved && !useIndex && level.size() * nw * 8 <= incrBytes;
       const bool parentIncr = incr && !rejPrev.empty();
       rejArena.resize(incr ? level.size() * nw : 0);
       rejCorr.resize(level.size());  // also used by the survivor lists
@@ -807,7 +974,7 @@ struct TableBeam {
         const Node &nd = nodes[ni];
         int m = 48 - nd.s.correct();
         if (m == 0) {
-          if (nd.g4 < best4) { best4 = nd.g4; bestNode = ni; bestSol = EG2::Sol(); bestAlg = -1; bestFin = nullptr; }
+          if (nd.g4 < best4) { best4 = nd.g4; bestNode = ni; bestSol = EG2::Sol(); bestAlg = -1; bestFin = false; }
           continue;
         }
         const long tPre = timing ? nsNow() : 0;
@@ -817,15 +984,16 @@ struct TableBeam {
             int e = 0;
             for (auto x : sol.path) e += cs->egEff4(cs->eg->cand, x);
             if (sol.finAlg >= 0) e += cs->egEff4(cs->eg->fin, sol.finAlg);
-            if (nd.g4 + e < best4) { best4 = nd.g4 + e; bestNode = ni; bestSol = sol; bestAlg = -1; bestFin = nullptr; }
+            if (nd.g4 + e < best4) { best4 = nd.g4 + e; bestNode = ni; bestSol = sol; bestAlg = -1; bestFin = false; }
           }
         }
         if (finish) {  // the node itself one algorithm from solved
-          const FinishTable::Slot *fi = finish->find(nd.h);
-          if (fi && nd.g4 + fi->e4 < best4) {
-            best4 = nd.g4 + fi->e4;
+          uint64_t ks[4] = {nd.h, nd.hr[0], nd.hr[1], nd.hr[2]};
+          FinishTable::Hit hit;
+          if (finish->find(ks, hit) && nd.g4 + hit.e4 < best4) {
+            best4 = nd.g4 + hit.e4;
             bestNode = nd.parent >= 0 ? nd.parent : ni;
-            bestAlg = nd.parent >= 0 ? (long)nd.alg : -2; bestFin = fi; bestSol = EG2::Sol();
+            bestAlg = nd.parent >= 0 ? (long)nd.alg : -2; bestFin = true; bestHit = hit; bestSol = EG2::Sol();
           }
         }
         const long tSeam0 = timing ? nsNow() : 0;
@@ -858,12 +1026,22 @@ struct TableBeam {
           if (seen[h & (SEEN - 1)] == h) return;
           if (finish) {
             const long tF = timing ? nsNow() : 0;
-            const FinishTable::Slot *fi = finish->find(h);
+            // the child's keys under the reducing rotations, from its parent's
+            uint64_t ks[4] = {h, 0, 0, 0};
+            if (fsym && fsym->n > 1)
+              for (int g = 1; g < fsym->n; g++) {
+                uint64_t k = nd.hr[g - 1];
+                const auto &Zg = fsym->Zr[g];
+                for (auto d : supp[a]) k ^= Zg[d][nd.s.col[d]] ^ Zg[d][nd.s.col[src[d]]];
+                ks[g] = k;
+              }
+            FinishTable::Hit hit;
+            const bool found = finish->find(ks, hit);
             if (timing) { nsAdmitFin += nsNow() - tF; nAdmitFin++; }
-            if (fi) {
-              if (g4 + fi->e4 < best4) {  // one more algorithm solves it
-                best4 = g4 + fi->e4;
-                bestNode = ni; bestAlg = a; bestFin = fi; bestSol = EG2::Sol();
+            if (found) {
+              if (g4 + hit.e4 < best4) {  // one more algorithm solves it
+                best4 = g4 + hit.e4;
+                bestNode = ni; bestAlg = a; bestFin = true; bestHit = hit; bestSol = EG2::Sol();
               }
               if (finishSkip) return;
             } else if (finishLBMis) {
@@ -1040,6 +1218,7 @@ struct TableBeam {
         State ns = nodes[sl.parent].s.apply(pool, sl.alg);
         seen[sl.h & (SEEN - 1)] = sl.h;
         nodes.push_back({ns, sl.h, sl.g4, sl.parent, sl.alg, sl.tail});
+        setRot(nodes.back());
         level.push_back(nodes.size() - 1);
       }
       if (timing) nsExpand += nsNow() - tExp;
@@ -1062,7 +1241,7 @@ struct TableBeam {
     std::reverse(r.begin(), r.end());
     if (bestFin) {
       if (bestAlg >= 0) r.push_back({0, (uint32_t)bestAlg});
-      r.push_back({bestFin->pid, bestFin->alg});
+      r.push_back({bestHit.pid, bestHit.alg});
     }
     for (auto x : bestSol.path) r.push_back({1, x});
     if (bestSol.finAlg >= 0) r.push_back({2, (uint32_t)bestSol.finAlg});
