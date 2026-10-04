@@ -166,6 +166,7 @@ struct Opts {
   int wingFactor = 4;  // wing beam width = this x the -b width
   int wingBeamCost = 7;  // wing class file: beam pool = images up to this many moves
   bool oneMerge = true;  // pairs + diagonals + mids in one merge (quality path)
+  int finishSym = 4;      // finish tables: one state per orbit of this many rotations (--nosym: 1)
   double timeBudget = -1;  // --time: seconds from start (-1: 10 + 50 N/1024; 0: off, plain -b width)
   int mergeBeam = -1;    // merge beam width (0: greedy merge; -1: by merge size, see mergeWith)
   bool pairMerge = false;  // pairwise (greedy-edge) merge instead (merge.h mergePairwise)
@@ -195,6 +196,7 @@ struct Res {
   // streamed from their binaries (pool ids 10+i, read on demand); algorithms
   // used from those are copied into extPool (pool id 6) after each solve
   FinishTable finish, finishExt;
+  FinishSym pairSym, diagSym, midSym;  // the finish tables' reducing rotations
   std::vector<ClassPool> pairClasses;  // pair finish algorithms (symmetry classes), pool ids 10..12
   OrbitModel pairModelR;
   bool fbSame = false;  // the fallback solver uses pairPool
@@ -281,6 +283,11 @@ struct Res {
         if (!pairClasses[i].load(files[i])) { fprintf(stderr, "cannot read %s\n", files[i]); return false; }
         list.push_back({&pairClasses[i], (uint8_t)(10 + i)});
       }
+      if (o.finishSym > 1) {  // one state per orbit of the rotations about U-D: 4x smaller
+        pairSym.build(pairModelR, pairBeam.Z, o.finishSym);
+        finishExt.sym = &pairSym;
+        pairBeam.fsym = &pairSym;
+      }
       buildFinishFromClassList(finish, finishExt, pairPool, pairBeam.Z, pairSolver.eff4, list, pairModelR);
       pairBeam.finish = &finish;
       mark("pair finish table");
@@ -303,6 +310,11 @@ struct Res {
     if (o.finish) {
       const char *fn = o.diagFinFile ? o.diagFinFile : D("diag_x10.cls");
       if (!diagClasses.load(fn)) { fprintf(stderr, "cannot read %s\n", fn); return false; }
+      if (o.finishSym > 1) {
+        diagSym.build(diagModelR, diagBeam.Z, o.finishSym);
+        diagFinishExt.sym = &diagSym;
+        diagBeam.fsym = &diagSym;
+      }
       buildFinishFromClasses(diagFinish, diagFinishExt, diagPool, diagBeam.Z, diagSolver.eff4, diagClasses, diagModelR, 10);
       diagBeam.finish = &diagFinish;
       mark("diag finish table");
@@ -316,6 +328,11 @@ struct Res {
       if (o.finish) {
         const char *fn = o.midFinFile ? o.midFinFile : D("mid_x10.cls");
         if (!midClasses.load(fn)) { fprintf(stderr, "cannot read %s\n", fn); return false; }
+        if (o.finishSym > 1) {
+          midSym.build(midModelR, midBeam.Z, o.finishSym);
+          midFinishExt.sym = &midSym;
+          midBeam.fsym = &midSym;
+        }
         buildFinishFromClasses(midFinish, midFinishExt, midPool, midBeam.Z, midSolver.eff4, midClasses, midModelR, 10);
         midBeam.finish = &midFinish;
         mark("mid finish table");
@@ -1008,6 +1025,8 @@ static void usage() {
       "    -F              print the start state as a Kociemba facelet string\n"
       "    --seed s        random seed (default: from entropy; the seed used is printed)\n"
       "  search:\n"
+      "    --nosym         full finish tables (default: one state per orbit of the four rotations\n"
+      "                    about the U-D axis, 4x smaller)\n"
       "    --time s        time budget in seconds from start (default: 10 + 50 N/1024): solves at widths\n"
       "                    1, 2, 4, ... for about 10% of it, then one final run at the width predicted to\n"
       "                    fit the rest; the best solve wins.  -b, -2, --fast or --time 0: no budget\n"
@@ -1095,6 +1114,7 @@ int main(int argc, char **argv) {
     else if (a == "-b") { o.width = atoi(argv[++i]); widthGiven = true; }  // beam width, all phases
     else if (a == "-2") o.doubling = true;                // growing widths until Ctrl-C; keep the best per pair
     else if (a == "--time") o.timeBudget = atof(argv[++i]);  // time budget (s, from start); 0: off
+    else if (a == "--nosym") o.finishSym = 1;                // full finish tables (no rotation reduction)
     else if (a == "--grow") o.grow = atof(argv[++i]);     // -2: width growth factor (default 2)
     else if (a == "--reps") o.reps = atoi(argv[++i]);     // -2: runs per width with different table seeds
     else if (a == "--wingwidth") o.wingWidth = atoi(argv[++i]);  // -2: wing beam width (default 16)
