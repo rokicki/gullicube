@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <strings.h>
+#include <cstring>
 #include <vector>
 #include <string>
 #include <iostream>

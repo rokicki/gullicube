@@ -96,7 +96,7 @@ mv parse_move(const char *& s) {
       while ('0' <= *s && *s <= '9')
          r.dep = 10 * r.dep + *s++ - '0' ;
    }
-   auto found = index(faceorder, *s) ;
+   auto found = strchr(faceorder, *s) ;
    if (found == 0) {
       cerr << s << endl ;
       error("! could not parse move") ;

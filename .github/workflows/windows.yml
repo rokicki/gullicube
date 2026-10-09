@@ -22,7 +22,7 @@ jobs:
           msystem: ${{ matrix.sys }}
           install: make mingw-w64-${{ matrix.env }}-${{ matrix.cxx == 'g++' && 'gcc' || 'clang' }}
       - run: ${{ matrix.cxx }} --version
-      - run: make -j4 CXX=${{ matrix.cxx }}
+      - run: make -k -j4 CXX=${{ matrix.cxx }}
       - run: ls -l gullicube.exe
   clang-cl:
     runs-on: windows-latest
