@@ -1,7 +1,8 @@
 name: windows-build
 on:
   push:
-    branches: [windows-ci]
+    branches: [main, windows-ci]
+  pull_request:
   workflow_dispatch:
 jobs:
   mingw:
@@ -34,12 +35,3 @@ jobs:
         run: |
           clang-cl --version
           clang-cl /O2 /std:c++20 /EHsc /Isrc/brob /Isrc/full -w src/full/gullicube.cpp src/full/brobglue.cpp src/brob/xcube.cpp src/brob/cornersolver.cpp src/brob/wingsolver.cpp src/brob/util.cpp src/brob/facelets.cpp /Fegullicube.exe
-  msvc:
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
-      - name: build with cl (informational; GCC builtins expected to fail)
-        shell: pwsh
-        run: cl /O2 /std:c++20 /EHsc /Isrc/brob /Isrc/full src/full/gullicube.cpp src/full/brobglue.cpp src/brob/xcube.cpp src/brob/cornersolver.cpp src/brob/wingsolver.cpp src/brob/util.cpp src/brob/facelets.cpp /Fegullicube.exe

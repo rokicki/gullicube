@@ -18,7 +18,7 @@ gullicube: $(OBJS)
 src/full/%.o: src/full/%.cpp $(HDRS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -Wall -c -o $@ $<
 
-# brobdicube's sources, unmodified (warnings off)
+# brobdicube's sources, unmodified apart from portability fixes (warnings off)
 src/brob/%.o: src/brob/%.cpp $(HDRS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -w -c -o $@ $<
 
