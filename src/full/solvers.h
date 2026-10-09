@@ -478,21 +478,22 @@ struct FinishTable {
     size_t probes = 0;
     for (size_t i = home(k);; i = step(i)) {
       if (++probes > nslots) { fprintf(stderr, "finish table full (%llu slots)\n", (unsigned long long)nslots); exit(1); }
-      std::atomic_ref<uint64_t> key(own[i].key);
-      uint64_t cur = key.load(std::memory_order_acquire);
+      // __atomic builtins rather than std::atomic_ref, which libc++ lacks before 19
+      uint64_t *key = &own[i].key;
+      uint64_t cur = __atomic_load_n(key, __ATOMIC_ACQUIRE);
       if (cur == 0) {
         uint64_t zero = 0;
-        if (!key.compare_exchange_strong(zero, k)) { cur = zero; if (cur != k) continue; }
+        if (!__atomic_compare_exchange_n(key, &zero, k, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) { cur = zero; if (cur != k) continue; }
         else claimed = 1;
       } else if (cur != k) continue;
-      std::atomic_ref<uint64_t> val(*(uint64_t *)((char *)&own[i] + 8));
-      uint64_t old = val.load(std::memory_order_relaxed);
+      uint64_t *val = (uint64_t *)((char *)&own[i] + 8);
+      uint64_t old = __atomic_load_n(val, __ATOMIC_RELAXED);
       for (;;) {
         Slot os;
         memcpy((char *)&os + 8, &old, 8);
         // keep the cheapest, ties to the lower (pool, algorithm): the result does not depend on thread timing
         if (old != 0 && (os.e4 < e || (os.e4 == e && (os.pid < id || (os.pid == id && os.alg <= b))))) return claimed;
-        if (val.compare_exchange_weak(old, nval)) return claimed;
+        if (__atomic_compare_exchange_n(val, &old, nval, true, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return claimed;
       }
     }
   }
