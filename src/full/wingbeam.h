@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <algorithm>
 #include <random>
@@ -200,15 +201,21 @@ struct WingTableBeam {
       return (size_t)(((unsigned __int128)x * (uint64_t)TS) >> 64);
     };
     auto tieKey = [&](uint64_t h) { uint64_t x = (h + seedMix) * 0xD6E8FEB86659FD93ULL; return x ^ (x >> 32); };
-    std::vector<Node> nodes;
-    nodes.push_back({start, zob(start), 0, -1, 0, 0xFFFF});
+    // every node's (parent, algorithm) for the solution walk, 8 bytes each (a deque:
+    // no doubling copies); full nodes only for the current level (cur, whose ids
+    // are the contiguous level[0] ..) and the one being built (nxt)
+    struct Step { int parent; uint32_t alg; };
+    std::deque<Step> hist;
+    std::vector<Node> cur, nxt;
+    hist.push_back({-1, 0});
+    cur.push_back({start, zob(start), 0, -1, 0, 0xFFFF});
     std::vector<int> level = {0};
     // duplicate filter sized to the beam: a fixed 16k overflowed at width 2048
     // and cancelling algorithm pairs then cycled until the depth cap
     int SEEN = 1 << 14;
     while (SEEN < 64 * TS && SEEN < (1 << 22)) SEEN <<= 1;
     std::vector<uint64_t> seen(SEEN, 0);
-    seen[nodes[0].h & (SEEN - 1)] = nodes[0].h;
+    seen[cur[0].h & (SEEN - 1)] = cur[0].h;
     int best4 = 1 << 30, bestNode = -1;
     long bestFin = -1;  // finishing algorithm after bestNode (or -1)
     long bestFinAlg = -1;  // algorithm between bestNode and the finish (-1: none)
@@ -238,7 +245,7 @@ struct WingTableBeam {
       for (size_t li = from; li < to; li++) {
         if ((li & 63) == 0 && stop && stop->load(std::memory_order_relaxed)) return;  // Ctrl-C: within a level too
         const int ni = level[li];
-        const Node &nd = nodes[ni];
+        const Node &nd = cur[ni - level[0]];
         uint32_t V[5] = {0, 0, 0, 0, 0};
         int c0 = 0;
         for (int p = 0; p < 24; p++) {
@@ -335,26 +342,30 @@ struct WingTableBeam {
           if (o.score == INT32_MIN) continue;
           if (sl.score == INT32_MIN || o.score > sl.score || (o.score == sl.score && tieKey(o.h) < tieKey(sl.h))) sl = o;
         }
+      const int curBase = level[0];
       level.clear();
+      nxt.clear();
       for (auto &sl : ctx[0].table) {
         if (sl.score == INT32_MIN) continue;
         Node c;
-        const Node &pn = nodes[sl.parent];
+        const Node &pn = cur[sl.parent - curBase];
         for (int j = 0; j < 24; j++) c.v[j] = pn.v[P.src[sl.alg][j]];
         c.h = sl.h; c.g4 = sl.g4; c.parent = sl.parent; c.alg = sl.alg; c.tail = sl.tail;
         seen[c.h & (SEEN - 1)] = c.h;
-        nodes.push_back(c);
-        level.push_back(nodes.size() - 1);
+        hist.push_back({sl.parent, sl.alg});
+        nxt.push_back(c);
+        level.push_back(hist.size() - 1);
       }
+      cur.swap(nxt);
     }
     if (getenv("WINGSTAT")) {
       long scored = 0;
-      fprintf(stderr, "  wing beam width %d: %zu nodes, best %d quarter-moves\n", TS, nodes.size(), best4);
+      fprintf(stderr, "  wing beam width %d: %zu nodes, best %d quarter-moves\n", TS, hist.size(), best4);
       (void)scored;
     }
     if (bestNode < 0) return {};
     std::vector<uint32_t> r;
-    for (int x = bestNode; nodes[x].parent >= 0; x = nodes[x].parent) r.push_back(nodes[x].alg);
+    for (int x = bestNode; hist[x].parent >= 0; x = hist[x].parent) r.push_back(hist[x].alg);
     std::reverse(r.begin(), r.end());
     if (bestFinAlg >= 0) r.push_back(bestFinAlg);
     if (bestFin >= 0) r.push_back((uint32_t)bestFin | FIN);

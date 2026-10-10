@@ -13,6 +13,7 @@
 // effcost charges face-turn setup moves (the X of X c X') at a discount, since
 // those mostly cancel when many orbit solutions are merged.
 #pragma once
+#include <deque>
 #include <mutex>
 #include <memory>
 #include <cmath>
@@ -888,41 +889,51 @@ struct TableBeam {
       x ^= x >> 29;
       return (size_t)(((unsigned __int128)x * (uint64_t)curTS) >> 64);
     };
-    std::vector<Node> nodes;
-    nodes.push_back({start, zob(start), 0, -1, 0, 0xFFFF});
-    setRot(nodes.back());
+    // every node's (parent, algorithm) for the solution walk, 8 bytes each (a deque:
+    // no doubling copies); full nodes only for the current level (cur, whose ids
+    // are the contiguous level[0] ..) and the one being built (nxt)
+    struct Step { int parent; uint32_t alg; };
+    std::deque<Step> hist;
+    std::vector<Node> cur, nxt;
+    hist.push_back({-1, 0});
+    cur.push_back({start, zob(start), 0, -1, 0, 0xFFFF});
+    setRot(cur.back());
     std::vector<int> level = {0};
     int SEEN = 1 << 12;  // duplicate filter, sized to the beam
     while (SEEN < 64 * TS && SEEN < (1 << 20)) SEEN <<= 1;
     std::vector<uint64_t> seen(SEEN, 0);
-    seen[nodes[0].h & (SEEN - 1)] = nodes[0].h;
+    seen[cur[0].h & (SEEN - 1)] = cur[0].h;
     if (seeds && !seeds->empty()) {
       // each seed a chain of nodes from the start; the chains' last nodes (contiguous,
       // as a level must be) form level 0
-      std::vector<int> lastInner;
+      std::vector<std::pair<Node, int>> lastInner;  // each chain's last inner node and its id
       for (auto &sd : *seeds) {
-        int par = 0;
+        Node pn = cur[0];
+        int pid = 0;
         for (size_t i = 0; i + 1 < sd.size(); i++) {
-          const Node &pn = nodes[par];
           State ns = pn.s.apply(pool, sd[i]);
-          nodes.push_back({ns, zob(ns), pn.g4 + cs->eff4[sd[i]], par, sd[i], 0xFFFF});
-          setRot(nodes.back());
-          par = nodes.size() - 1;
+          hist.push_back({pid, sd[i]});
+          pn = {ns, zob(ns), pn.g4 + cs->eff4[sd[i]], pid, sd[i], 0xFFFF};
+          pid = hist.size() - 1;
         }
-        lastInner.push_back(par);
+        lastInner.push_back({pn, pid});
       }
       level.clear();
       for (size_t k = 0; k < seeds->size(); k++) {
         const auto &sd = (*seeds)[k];
         if (sd.empty()) continue;
-        const int par = lastInner[k];
-        State ns = nodes[par].s.apply(pool, sd.back());
-        nodes.push_back({ns, zob(ns), nodes[par].g4 + cs->eff4[sd.back()], par, sd.back(), 0xFFFF});
-        setRot(nodes.back());
-        level.push_back(nodes.size() - 1);
-        seen[nodes.back().h & (SEEN - 1)] = nodes.back().h;
+        const Node &pn = lastInner[k].first;
+        const int par = lastInner[k].second;
+        State ns = pn.s.apply(pool, sd.back());
+        hist.push_back({par, sd.back()});
+        nxt.push_back({ns, zob(ns), pn.g4 + cs->eff4[sd.back()], par, sd.back(), 0xFFFF});
+        setRot(nxt.back());
+        level.push_back(hist.size() - 1);
+        seen[nxt.back().h & (SEEN - 1)] = nxt.back().h;
       }
       if (level.empty()) level = {0};
+      else cur.swap(nxt);
+      nxt.clear();
     }
     std::vector<Slot> table(TS);
     MinTree minTree;
@@ -951,11 +962,24 @@ struct TableBeam {
     std::vector<uint32_t> survDat, survDatPrev, survBeg, survBegPrev, survEnd, survEndPrev;
     std::vector<uint8_t> rejOk, rejOkPrev;  // the node's incremental reject set was built
     std::vector<uint32_t> cands;            // a node's survivors (bitset path)
-    // finish lookups of admitted children, resolved at the level's end (their slots
-    // prefetched); only when the lookup does not decide admission
+    // finish lookups of admitted children, resolved at the level's end or once
+    // pendMax are queued (their slots prefetched meanwhile); only when the lookup
+    // does not decide admission.  A level admits ~100 x width children, so an
+    // unbounded queue (48 bytes each) cost ~6 KB per unit of width per beam.
     struct PendFin { uint64_t ks[4]; int g4, ni; uint32_t a; };
     std::vector<PendFin> pendFin;
     const bool deferFinish = finish && !finishSkip && !finishLBMis && !getenv("NODEFER");
+    const size_t pendMax = getenv("PENDMAX") ? atol(getenv("PENDMAX")) : 1 << 16;
+    auto flushFin = [&]() {
+      for (const auto &p : pendFin) {
+        FinishTable::Hit hit;
+        if (finish->find(p.ks, hit) && p.g4 + hit.e4 < best4) {
+          best4 = p.g4 + hit.e4;
+          bestNode = p.ni; bestAlg = p.a; bestFin = true; bestHit = hit; bestSol = EG2::Sol();
+        }
+      }
+      pendFin.clear();
+    };
     const uint32_t PF = getenv("PFDIST") ? atoi(getenv("PFDIST")) : 32;  // prefetch distance (survivor lists)
 
     long nAdmit = 0, nLevels = 0;
@@ -991,7 +1015,7 @@ struct TableBeam {
       size_t nodeCount = 0;
       for (int ni : level) {
         if ((++nodeCount & 63) == 0 && stop && stop->load(std::memory_order_relaxed)) return {};  // Ctrl-C within a level
-        const Node &nd = nodes[ni];
+        const Node &nd = cur[ni - levelBase];
         int m = 48 - nd.s.correct();
         if (m == 0) {
           if (nd.g4 < best4) { best4 = nd.g4; bestNode = ni; bestSol = EG2::Sol(); bestAlg = -1; bestFin = false; }
@@ -1058,6 +1082,7 @@ struct TableBeam {
             if (deferFinish) {  // looked up at the level's end, its slots fetched meanwhile
               finish->prefetch(ks);
               pendFin.push_back({{ks[0], ks[1], ks[2], ks[3]}, g4, ni, (uint32_t)a});
+              if (pendFin.size() >= pendMax) flushFin();
               if (timing) { nsAdmitFin += nsNow() - tF; nAdmitFin++; }
             } else {
             FinishTable::Hit hit;
@@ -1244,25 +1269,21 @@ struct TableBeam {
         }
       }
         }
-      // the level's deferred finish lookups
-      for (const auto &p : pendFin) {
-        FinishTable::Hit hit;
-        if (finish->find(p.ks, hit) && p.g4 + hit.e4 < best4) {
-          best4 = p.g4 + hit.e4;
-          bestNode = p.ni; bestAlg = p.a; bestFin = true; bestHit = hit; bestSol = EG2::Sol();
-        }
-      }
-      pendFin.clear();
+      flushFin();  // the level's remaining deferred finish lookups
       const long tExp = timing ? nsNow() : 0;
+      const int curBase = level[0];
       level.clear();
+      nxt.clear();
       for (auto &sl : table) {
         if (sl.score == INT32_MIN) continue;
-        State ns = nodes[sl.parent].s.apply(pool, sl.alg);
+        State ns = cur[sl.parent - curBase].s.apply(pool, sl.alg);
         seen[sl.h & (SEEN - 1)] = sl.h;
-        nodes.push_back({ns, sl.h, sl.g4, sl.parent, sl.alg, sl.tail});
-        setRot(nodes.back());
-        level.push_back(nodes.size() - 1);
+        hist.push_back({sl.parent, sl.alg});
+        nxt.push_back({ns, sl.h, sl.g4, sl.parent, sl.alg, sl.tail});
+        setRot(nxt.back());
+        level.push_back(hist.size() - 1);
       }
+      cur.swap(nxt);
       if (timing) nsExpand += nsNow() - tExp;
       if (depth == 0 && rootTop && rootScores.size() > 0) {
         const size_t M = std::min<size_t>(rootTop, rootScores.size());
@@ -1279,7 +1300,7 @@ struct TableBeam {
     statSolves++;
     std::vector<AlgRef> r;
     if (bestNode < 0) return r;
-    for (int nn = bestNode; nodes[nn].parent >= 0; nn = nodes[nn].parent) r.push_back({0, nodes[nn].alg});
+    for (int nn = bestNode; hist[nn].parent >= 0; nn = hist[nn].parent) r.push_back({0, hist[nn].alg});
     std::reverse(r.begin(), r.end());
     if (bestFin) {
       if (bestAlg >= 0) r.push_back({0, (uint32_t)bestAlg});
